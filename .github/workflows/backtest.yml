@@ -1,0 +1,52 @@
+name: nvda-backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      months:
+        description: "Meses de historia a probar (1 a 36)"
+        default: "6"
+        required: true
+      feed:
+        description: "Datos: iex (los mismos que usa el bot) o sip (mercado completo)"
+        type: choice
+        options:
+          - iex
+          - sip
+        default: iex
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install pandas requests
+
+      - name: Ejecutar backtest
+        env:
+          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MONTHS: ${{ inputs.months }}
+          FEED: ${{ inputs.feed }}
+        run: python backtest.py --months "$MONTHS" --feed "$FEED" --telegram
+
+      - name: Guardar operaciones
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest_trades
+          path: backtest_trades.csv
+          if-no-files-found: ignore
