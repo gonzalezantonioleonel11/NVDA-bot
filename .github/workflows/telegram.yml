@@ -1,0 +1,39 @@
+name: telegram-comandos
+
+# Escucha los comandos que mandás al bot de Telegram ("estado", "ayuda") y los responde.
+# Cada corrida escucha ~14 minutos y el cron arranca una nueva cada 5, así siempre hay una
+# esperando para seguir: de lunes a viernes, aprox. de 7 a 19 hs de Nueva York.
+on:
+  schedule:
+    - cron: "*/5 11-23 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-comandos
+  cancel-in-progress: false
+
+jobs:
+  listen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install pandas requests
+
+      - name: Escuchar comandos de Telegram
+        env:
+          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python orb_bot.py listen

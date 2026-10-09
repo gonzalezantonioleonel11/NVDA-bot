@@ -12,10 +12,13 @@ Modos (los elige el workflow orb.yml):
   python orb_bot.py close       ~15:30-15:55 NY: cierra todo a las 15:50 y manda el resumen
   python orb_bot.py diagnostic  muestra la selección de la última sesión y la cuenta, sin operar
   python orb_bot.py status      posiciones abiertas, resultado del día y operaciones cerradas, sin operar
+  python orb_bot.py listen      escucha comandos de Telegram ("estado", "ayuda") durante LISTEN_MINUTES
 """
 import csv
+import json
 import math
 import os
+import re
 import sys
 import time
 
@@ -51,6 +54,7 @@ ENTRY_DEADLINE_MIN = 12 * 60   # no abre operaciones después de las 12:00 NY
 FLATTEN_BEFORE_CLOSE = pd.Timedelta(minutes=10)
 MIN_STOP_PCT = 0.0005     # no opera stops más chicos que 0,05% del precio
 POLL_SECONDS = 5
+LISTEN_MINUTES = 14       # cada corrida del workflow telegram.yml escucha este tiempo
 ORDER_PREFIX = "orb"
 JOURNAL = "orb_journal.csv"
 NAME = f"ORB{OR_MINUTES}"
@@ -416,11 +420,63 @@ def run_status():
     bot.telegram("\n".join(lines))
 
 
+HELP = ("🤖 Comandos:\n"
+        "• estado: posiciones abiertas, operaciones cerradas y resultado de hoy\n"
+        "• ayuda: esta lista\n"
+        "Respondo de lunes a viernes de 7 a 19 hs de Nueva York.")
+
+
+def telegram_updates(offset, timeout):
+    params = {"timeout": timeout, "allowed_updates": json.dumps(["message"])}
+    if offset is not None:
+        params["offset"] = offset
+    response = bot.SESSION.get(f"https://api.telegram.org/bot{bot.TG_TOKEN}/getUpdates",
+                               params=params, timeout=timeout + 15)
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram getUpdates: {data}")
+    return data["result"]
+
+
+def handle_command(text):
+    word = re.sub(r"[^a-záéíóúñ]", "", (text or "").strip().lower().split("@")[0].split(" ")[0])
+    if word in ("estado", "status"):
+        run_status()
+    elif word in ("ayuda", "help", "start", "comandos"):
+        bot.telegram(HELP)
+
+
+def run_listen():
+    """Long-poll Telegram for commands from the configured chat; the workflow restarts it every few minutes."""
+    end = time.monotonic() + LISTEN_MINUTES * 60
+    offset = None
+    while time.monotonic() < end:
+        try:
+            updates = telegram_updates(offset, int(min(50, max(1, end - time.monotonic()))))
+        except Exception as exc:  # network blips: wait and keep listening
+            print("getUpdates falló:", bot.redact(str(exc))[:300])
+            time.sleep(5)
+            continue
+        for update in updates:
+            offset = update["update_id"] + 1
+            message = update.get("message") or {}
+            if str((message.get("chat") or {}).get("id")) != str(bot.TG_CHAT):
+                continue  # only the owner's chat can run commands
+            try:
+                handle_command(message.get("text"))
+            except Exception as exc:
+                bot.telegram(f"⚠️ No pude responder el comando: {bot.redact(f'{type(exc).__name__}: {exc}')[:300]}")
+    if offset is not None:
+        telegram_updates(offset, 0)  # confirm the last batch so the next run does not repeat it
+
+
 def main():
     if not bot.KEY or not bot.SECRET:
         raise RuntimeError("Faltan ALPACA_KEY o ALPACA_SECRET en los secrets de GitHub.")
     mode = sys.argv[1] if len(sys.argv) > 1 else "diagnostic"
-    {"session": run_session, "close": run_close, "diagnostic": run_diagnostic, "status": run_status}[mode]()
+    {"session": run_session, "close": run_close, "diagnostic": run_diagnostic, "status": run_status,
+     "listen": run_listen}[mode]()
 
 
 if __name__ == "__main__":
