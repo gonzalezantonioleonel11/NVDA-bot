@@ -195,7 +195,7 @@ def enter(c, side, price, equity, today):
 
 
 def breakout(c, df):
-    """First 1-minute close outside the range -> (side, latest close) or None."""
+    """First 1-minute close outside the range -> (side, latest close, minute of the breakout) or None."""
     up = df["c"] > c["high"]
     down = df["c"] < c["low"]
     if c["side"] == 1:
@@ -206,7 +206,7 @@ def breakout(c, df):
     if hits.empty:
         return None
     first = hits.index[0]
-    return (1 if up[first] else -1), float(df["c"].iloc[-1])
+    return (1 if up[first] else -1), float(df["c"].iloc[-1]), first
 
 
 # ------------------------------------------------------------------ sesiones
@@ -238,11 +238,15 @@ def run_session():
         return
     session_open, session_close = sess
     range_end = session_open + pd.Timedelta(minutes=OR_MINUTES)
-    # Several crons cover summer and winter time and GitHub's delays; only a run that starts
-    # before the selection works, and a queued duplicate starts after it and exits here.
-    if not (session_open - pd.Timedelta(minutes=50) <= now <= range_end - pd.Timedelta(minutes=1)):
+    deadline = min(session_open.replace(hour=ENTRY_DEADLINE_MIN // 60, minute=ENTRY_DEADLINE_MIN % 60),
+                   session_close - FLATTEN_BEFORE_CLOSE)
+    # Several crons cover summer and winter time; the one that is not near the open exits here,
+    # and so does a queued duplicate that only starts when the first run is done.
+    if not (session_open - pd.Timedelta(minutes=50) <= now <= deadline - pd.Timedelta(minutes=5)):
         print(f"Fuera de la ventana de la sesión ({now:%H:%M} NY); sale sin hacer nada.")
         return
+    # If GitHub started this run late, only breakouts from now on count: never chase an old one.
+    watch_from = max(range_end, now.floor("min"))
     today = session_open.strftime("%Y%m%d")
     hist = history(UNIVERSE, session_open)
     wait_until(range_end + pd.Timedelta(seconds=3))
@@ -251,12 +255,14 @@ def run_session():
     if not cands:
         bot.telegram(f"📭 {NAME}: hoy ninguna acción del universo tuvo volumen relativo suficiente. No se opera.")
         return
-    deadline = min(session_open.replace(hour=ENTRY_DEADLINE_MIN // 60, minute=ENTRY_DEADLINE_MIN % 60),
-                   session_close - FLATTEN_BEFORE_CLOSE)
-    bot.telegram("\n".join([f"🎯 {NAME} en juego hoy ({len(cands)}):"] + [describe(c) for c in cands] + [
-        f"Entra cuando una vela de 1 minuto cierre fuera del rango (hasta las {deadline:%H:%M} NY)."]))
+    already = {o["symbol"] for o in our_orders(session_open)}
+    if already:
+        print(f"Ya se operaron hoy: {', '.join(sorted(already))}; sigue solo con el resto.")
+    else:
+        bot.telegram("\n".join([f"🎯 {NAME} en juego hoy ({len(cands)}):"] + [describe(c) for c in cands] + [
+            f"Entra cuando una vela de 1 minuto cierre fuera del rango (hasta las {deadline:%H:%M} NY)."]))
 
-    pending = {c["sym"]: c for c in cands}
+    pending = {c["sym"]: c for c in cands if c["sym"] not in already}
     while pending and pd.Timestamp.now(tz=NY) < deadline:
         now = pd.Timestamp.now(tz=NY)
         bars = multi_bars(list(pending), "1Min", iso(range_end), iso(now + pd.Timedelta(minutes=1)))
@@ -264,12 +270,17 @@ def run_session():
             df = bars.get(sym)
             if df is None:
                 continue
-            got = breakout(pending[sym], df[df.index + pd.Timedelta(minutes=1) <= now])
+            closed = df[df.index + pd.Timedelta(minutes=1) <= now]
+            got = breakout(pending[sym], closed)
             if got:
-                side, price = got
+                side, price, when = got
+                if when < watch_from:
+                    pending.pop(sym)
+                    bot.telegram(f"⏭️ {NAME} {sym}: rompió el rango antes de que arrancara el bot; no se persigue.")
+                    continue
                 bot.telegram(f"📌 {NAME} " + enter(pending.pop(sym), side, price, equity, today))
         time.sleep(POLL_SECONDS)
-    if pending:
+    if pending and pd.Timestamp.now(tz=NY) >= deadline:
         bot.telegram("⌛ Sin ruptura confirmada antes del límite: " + ", ".join(pending) + ". No se operan.")
     # Half days close at 13:00, before the afternoon job runs: flatten from here.
     if session_close.hour < 15:
