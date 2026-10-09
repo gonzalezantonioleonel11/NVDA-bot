@@ -11,7 +11,7 @@ import requests
 # SAFETY: this version is hard-wired to Alpaca PAPER trading.
 TRADING_URL = "https://paper-api.alpaca.markets"
 DATA_URL = "https://data.alpaca.markets"
-SYMBOL = "NVDA"
+SYMBOL = os.environ.get("SYMBOL", "NVDA").upper()
 NY = "America/New_York"
 STATE_FILE = "estado.json"
 
@@ -22,14 +22,20 @@ RR = 2.0                       # take-profit distance = stop distance * this rat
 ADX_MIN = 20
 MAX_TRADES_DAY = 3
 MAX_NOTIONAL_PCT = 20.0        # cap exposure to 20% of equity per position
-MAX_DRIFT_ATR = 0.5             # reject if price moved too far from signal close
-MAX_OPEN_POSITIONS = 1
+MAX_DRIFT_ATR = 0.5            # reject if price moved too far from signal close
 ENTRY_START = dtime(9, 45)
 ENTRY_END = dtime(15, 20)
 FORCE_FLAT_TIME = dtime(15, 50)
+APPROVAL_TIMEOUT = 180         # seconds to wait for the Telegram button
 
-KEY = os.environ["ALPACA_KEY"]
-SECRET = os.environ["ALPACA_SECRET"]
+# Confluence scoring: trend filters are mandatory, then at least MIN_SCORE
+# of the optional confirmations must agree, and at least one must be a trigger.
+MIN_SCORE = 5
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
+
+KEY = os.environ.get("ALPACA_KEY", "")
+SECRET = os.environ.get("ALPACA_SECRET", "")
 TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 MANUAL = os.environ.get("MANUAL", "false").lower() == "true"
@@ -40,7 +46,6 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 SESSION = requests.Session()
-
 
 
 def telegram(message):
@@ -69,6 +74,8 @@ def api(method, path, *, params=None, payload=None, allow_404=False):
     )
     if allow_404 and response.status_code == 404:
         return None
+    if not response.ok:
+        print(f"Alpaca {method} {path} -> {response.status_code}: {response.text[:500]}")
     response.raise_for_status()
     if not response.text:
         return {}
@@ -126,8 +133,36 @@ def get_bars():
     return frame
 
 
+def get_latest_price():
+    response = SESSION.get(
+        f"{DATA_URL}/v2/stocks/{SYMBOL}/trades/latest",
+        headers=HEADERS,
+        params={"feed": "iex"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    price = float((response.json().get("trade") or {}).get("p", 0))
+    if price <= 0:
+        raise RuntimeError("No se pudo obtener el último precio.")
+    return price
+
+
 def rma(series, period):
     return series.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+
+
+def add_higher_timeframe_trend(df):
+    """1-hour trend built only from completed hours, aligned back onto 5-min bars."""
+    hourly = df["close"].resample("1h", label="right", closed="left").last().dropna()
+    ema = hourly.ewm(span=20, adjust=False).mean()
+    trend = pd.Series(0, index=hourly.index)
+    trend[(hourly > ema) & (ema > ema.shift(1))] = 1
+    trend[(hourly < ema) & (ema < ema.shift(1))] = -1
+    # An hour labelled 11:00 covers 10:00-10:59 and is usable from the 10:55 bar's close
+    # (labelled 10:55 in the 5-min frame), i.e. once bar_time + 5min >= hour label.
+    bar_close = df.index + pd.Timedelta(minutes=5)
+    aligned = trend.reindex(bar_close, method="ffill")
+    return pd.Series(aligned.to_numpy(), index=df.index).fillna(0).astype(int)
 
 
 def add_indicators(frame):
@@ -209,52 +244,96 @@ def add_indicators(frame):
     df["market_bias"] = bias_values
     df["structure_up_recent"] = df["structure_event"].isin(["BOS_UP", "CHoCH_UP"]).rolling(3).max().fillna(0).astype(bool)
     df["structure_down_recent"] = df["structure_event"].isin(["BOS_DOWN", "CHoCH_DOWN"]).rolling(3).max().fillna(0).astype(bool)
-    df["sweep_bull_recent"] = df["sweep_bull"].rolling(6, min_periods=1).max().fillna(False).astype(bool)
-    df["sweep_bear_recent"] = df["sweep_bear"].rolling(6, min_periods=1).max().fillna(False).astype(bool)
-    df["fvg_bull_recent"] = df["fvg_bull"].rolling(6, min_periods=1).max().fillna(False).astype(bool)
-    df["fvg_bear_recent"] = df["fvg_bear"].rolling(6, min_periods=1).max().fillna(False).astype(bool)
+    df["sweep_bull_recent"] = df["sweep_bull"].astype(float).rolling(6, min_periods=1).max().fillna(0).astype(bool)
+    df["sweep_bear_recent"] = df["sweep_bear"].astype(float).rolling(6, min_periods=1).max().fillna(0).astype(bool)
+    df["fvg_bull_recent"] = df["fvg_bull"].astype(float).rolling(6, min_periods=1).max().fillna(0).astype(bool)
+    df["fvg_bear_recent"] = df["fvg_bear"].astype(float).rolling(6, min_periods=1).max().fillna(0).astype(bool)
+
+    df["htf_trend"] = add_higher_timeframe_trend(df)
 
     return df
 
 
-def evaluate(row):
-    # Original indicator filters are retained; structure plus FVG/sweep add confluence.
-    base = (
-        pd.notna(row["adx"])
-        and row["adx"] > ADX_MIN
-        and bool(row["vol_ok"])
-        and pd.notna(row["atr"])
-        and row["atr"] > 0
-        and pd.notna(row["vwap"])
-        and pd.notna(row["rsi"])
-        and pd.notna(row["rsi_prev"])
+def side_checks(row, side):
+    """Checklist for one side: (mandatory, optional, has_trigger)."""
+    up = side == "LONG"
+    mandatory = [
+        ("ADX > %d (hay tendencia)" % ADX_MIN, row["adx"] > ADX_MIN),
+        ("EMA20 %s EMA50" % (">" if up else "<"),
+         row["ema_fast"] > row["ema_slow"] if up else row["ema_fast"] < row["ema_slow"]),
+        ("Precio %s VWAP" % ("sobre" if up else "bajo"),
+         row["close"] > row["vwap"] if up else row["close"] < row["vwap"]),
+        ("Tendencia 1H %s" % ("alcista" if up else "bajista"),
+         row["htf_trend"] == (1 if up else -1)),
+    ]
+    rsi_trigger = (
+        row["rsi_prev"] <= 45 < row["rsi"] if up else row["rsi_prev"] >= 55 > row["rsi"]
     )
+    structure = bool(row["structure_up_recent"] if up else row["structure_down_recent"])
+    sweep = bool(row["sweep_bull_recent"] if up else row["sweep_bear_recent"])
+    optional = [
+        ("RSI gatillo (cruce %s)" % ("45↑" if up else "55↓"), rsi_trigger),
+        ("Estructura BOS/CHoCH reciente", structure),
+        ("Barrido de liquidez reciente", sweep),
+        ("FVG reciente", bool(row["fvg_bull_recent"] if up else row["fvg_bear_recent"])),
+        ("MACD histograma %s" % ("> 0" if up else "< 0"),
+         row["macd_hist"] > 0 if up else row["macd_hist"] < 0),
+        ("Sesgo de estructura %s" % ("alcista" if up else "bajista"),
+         row["market_bias"] == (1 if up else -1)),
+        ("Volumen sobre promedio", bool(row["vol_ok"])),
+        ("RSI sin %s" % ("sobrecompra" if up else "sobreventa"),
+         row["rsi"] < RSI_OVERBOUGHT if up else row["rsi"] > RSI_OVERSOLD),
+    ]
+    mandatory = [(label, bool(ok)) for label, ok in mandatory]
+    optional = [(label, bool(ok)) for label, ok in optional]
+    return mandatory, optional, bool(rsi_trigger or structure or sweep)
 
-    long_signal = (
-        base
-        and row["ema_fast"] > row["ema_slow"]
-        and row["close"] > row["vwap"]
-        and row["rsi_prev"] <= 45 < row["rsi"]
-        and row["macd_hist"] > 0
-        and bool(row["structure_up_recent"])
-        and (bool(row["fvg_bull_recent"]) or bool(row["sweep_bull_recent"]))
-        and row["market_bias"] == 1
-    )
-    short_signal = (
-        base
-        and row["ema_fast"] < row["ema_slow"]
-        and row["close"] < row["vwap"]
-        and row["rsi_prev"] >= 55 > row["rsi"]
-        and row["macd_hist"] < 0
-        and bool(row["structure_down_recent"])
-        and (bool(row["fvg_bear_recent"]) or bool(row["sweep_bear_recent"]))
-        and row["market_bias"] == -1
-    )
-    if long_signal:
-        return "LONG"
-    if short_signal:
-        return "SHORT"
-    return None
+
+def data_ready(row):
+    return all(
+        pd.notna(row[c]) for c in ("adx", "atr", "vwap", "rsi", "rsi_prev", "ema_fast", "ema_slow")
+    ) and row["atr"] > 0
+
+
+def analyze(row):
+    """
+    Returns (side, score, checks) where checks is a list of (label, passed) for the
+    chosen side. side is None when no setup qualifies.
+    Trend filters are mandatory; then at least MIN_SCORE of the 8 confirmations must
+    agree and at least one of them must be a trigger (RSI cross, BOS/CHoCH or sweep).
+    """
+    if not data_ready(row):
+        return None, 0, []
+    best = (None, 0, [])
+    for side in ("LONG", "SHORT"):
+        mandatory, optional, has_trigger = side_checks(row, side)
+        score = sum(ok for _, ok in optional)
+        if all(ok for _, ok in mandatory) and has_trigger and score >= MIN_SCORE and score > best[1]:
+            best = (side, score, mandatory + optional)
+    return best
+
+
+def evaluate(row):
+    return analyze(row)[0]
+
+
+def compute_levels(side, entry, stop_distance):
+    if side == "LONG":
+        stop_price = round(entry - stop_distance, 2)
+        tp_price = round(entry + stop_distance * RR, 2)
+    else:
+        stop_price = round(entry + stop_distance, 2)
+        tp_price = round(entry - stop_distance * RR, 2)
+    return stop_price, tp_price
+
+
+def position_size(equity, buying_power, price, stop_distance):
+    risk_dollars = equity * (RISK_PCT / 100.0)
+    max_notional = equity * (MAX_NOTIONAL_PCT / 100.0)
+    qty_by_risk = math.floor(risk_dollars / stop_distance)
+    qty_by_notional = math.floor(max_notional / price)
+    qty_by_buying_power = math.floor(buying_power / price)
+    return max(0, min(qty_by_risk, qty_by_notional, qty_by_buying_power)), risk_dollars
 
 
 def load_state():
@@ -285,7 +364,7 @@ def telegram_api(method, payload):
     return result.get("result")
 
 
-def ask_approval(signal_text, timeout_seconds=180):
+def ask_approval(signal_text, timeout_seconds=APPROVAL_TIMEOUT):
     """
     Sends inline Approve/Reject buttons and waits for a callback.
     Returns 'approve', 'reject', or 'timeout'.
@@ -321,9 +400,10 @@ def ask_approval(signal_text, timeout_seconds=180):
             {"text": "❌ RECHAZAR", "callback_data": f"reject:{token}"},
         ]]
     }
+    minutes = timeout_seconds // 60
     message = telegram_api("sendMessage", {
         "chat_id": TG_CHAT,
-        "text": signal_text + "\n\n⏳ Esperando tu decisión. Si no respondés en 3 minutos, no se opera.",
+        "text": signal_text + f"\n\n⏳ Esperando tu decisión. Si no respondés en {minutes} minutos, no se opera.",
         "reply_markup": keyboard,
     })
     message_id = message["message_id"]
@@ -402,13 +482,13 @@ def ask_approval(signal_text, timeout_seconds=180):
     telegram_api("editMessageText", {
         "chat_id": TG_CHAT,
         "message_id": message_id,
-        "text": signal_text + "\n\n⌛ Señal vencida: no se recibió aprobación en 3 minutos. No se operó.",
+        "text": signal_text + f"\n\n⌛ Señal vencida: no se recibió aprobación en {minutes} minutos. No se operó.",
         "reply_markup": {"inline_keyboard": []},
     })
     return "timeout"
 
 
-def send_order(side, qty, stop, take_profit):
+def send_order(side, qty, stop, take_profit, client_order_id):
     payload = {
         "symbol": SYMBOL,
         "qty": str(qty),
@@ -418,18 +498,30 @@ def send_order(side, qty, stop, take_profit):
         "order_class": "bracket",
         "take_profit": {"limit_price": f"{take_profit:.2f}"},
         "stop_loss": {"stop_price": f"{stop:.2f}"},
+        "client_order_id": client_order_id,
     }
     # The endpoint is hard-coded to paper-api.alpaca.markets above.
     return api("POST", "/v2/orders", payload=payload)
 
 
+def wait_for_fill(order_id, timeout_seconds=20):
+    deadline = time.monotonic() + timeout_seconds
+    order = {}
+    while time.monotonic() < deadline:
+        order = api("GET", f"/v2/orders/{order_id}")
+        if order.get("status") in ("filled", "canceled", "rejected", "expired"):
+            break
+        time.sleep(2)
+    return order
+
+
 def has_position_or_open_order():
     positions = api("GET", "/v2/positions")
     if any(p.get("symbol") == SYMBOL for p in positions):
-        return True, "Ya existe una posición abierta en NVDA."
+        return True, f"Ya existe una posición abierta en {SYMBOL}."
     orders = api("GET", "/v2/orders", params={"status": "open", "symbols": SYMBOL, "limit": 100})
     if orders:
-        return True, "Ya hay una orden abierta para NVDA."
+        return True, f"Ya hay una orden abierta para {SYMBOL}."
     return False, ""
 
 
@@ -440,12 +532,71 @@ def close_position_end_of_day():
     position = api("GET", f"/v2/positions/{SYMBOL}", allow_404=True)
     if position:
         api("DELETE", f"/v2/positions/{SYMBOL}")
-        telegram("🧹 Cierre de fin de día solicitado para NVDA en PAPER. Verificá en Alpaca que la posición se haya cerrado.")
+        telegram(f"🧹 Cierre de fin de día solicitado para {SYMBOL} en PAPER. Verificá en Alpaca que la posición se haya cerrado.")
     else:
-        print("Fin de día: no hay posición NVDA abierta.")
+        print(f"Fin de día: no hay posición {SYMBOL} abierta.")
+
+
+def format_checks(checks):
+    return "\n".join(f"{'✅' if ok else '▫️'} {label}" for label, ok in checks)
+
+
+def format_signal(side, bar_time, row, score, checks, entry, stop, tp, qty, risk_dollars):
+    arrow = "🟢 COMPRA (LONG)" if side == "LONG" else "🔴 VENTA EN CORTO (SHORT)"
+    stop_dist = abs(entry - stop)
+    return (
+        f"📈 SEÑAL {SYMBOL} — {arrow}\n"
+        f"Vela 5m: {bar_time.strftime('%Y-%m-%d %H:%M')} NY\n"
+        f"Confluencia: {score}/8 (mínimo {MIN_SCORE})\n\n"
+        f"{format_checks(checks)}\n\n"
+        f"💵 Entrada aprox: ${entry:.2f}\n"
+        f"🛑 Stop loss: ${stop:.2f} (-${stop_dist:.2f}/acción)\n"
+        f"🎯 Take profit: ${tp:.2f} (R:R 1:{RR:g})\n"
+        f"📦 Cantidad: {qty} acciones (~${qty * entry:,.2f})\n"
+        f"⚖️ Riesgo máx: ~${qty * stop_dist:,.2f} (presupuesto ${risk_dollars:,.2f})\n"
+        f"RSI {row['rsi']:.1f} · ADX {row['adx']:.1f} · ATR {row['atr']:.2f}\n"
+        "Cuenta: Alpaca PAPER"
+    )
+
+
+def run_diagnostics(now_ny):
+    account_equity, _ = get_account()
+    clock = get_clock()
+    lines = [
+        "🧪 Diagnóstico PAPER solamente",
+        f"Cuenta equity: ${account_equity:.2f}",
+        f"Mercado abierto según Alpaca: {clock.get('is_open')}",
+        f"Hora Nueva York: {now_ny.strftime('%Y-%m-%d %H:%M:%S')}",
+    ]
+    frame = get_bars()
+    if not frame.empty:
+        frame = frame.between_time("09:30", "15:59")
+    if len(frame) >= 100:
+        enriched = add_indicators(frame)
+        row = enriched.iloc[-1]
+        lines.append(f"\nÚltima vela {SYMBOL}: {enriched.index[-1].strftime('%Y-%m-%d %H:%M')} cierre ${row['close']:.2f}")
+        side, score, _ = analyze(row)
+        if side:
+            lines.append(f"Señal actual: {side} ({score}/8)")
+        elif data_ready(row):
+            # Show the checklist for the side the EMAs lean towards, for transparency.
+            lean = "LONG" if row["ema_fast"] > row["ema_slow"] else "SHORT"
+            mandatory, optional, _ = side_checks(row, lean)
+            lines.append(
+                f"Sin señal. Chequeo {lean} "
+                f"({sum(ok for _, ok in optional)}/8, mínimo {MIN_SCORE}):"
+            )
+            lines.append(format_checks(mandatory + optional))
+    else:
+        lines.append("Datos insuficientes para analizar.")
+    lines.append("\nLa ejecución manual no envía órdenes.")
+    telegram("\n".join(lines))
 
 
 def main():
+    if not KEY or not SECRET:
+        raise RuntimeError("Faltan ALPACA_KEY / ALPACA_SECRET.")
+
     now_utc = pd.Timestamp.now(tz="UTC")
     now_ny = now_utc.tz_convert(NY)
     state = load_state()
@@ -455,15 +606,7 @@ def main():
 
     # Manual workflow runs are diagnostics only; they never place orders.
     if MANUAL:
-        account_equity, _ = get_account()
-        clock = get_clock()
-        telegram(
-            "🧪 Diagnóstico PAPER solamente\n"
-            f"Cuenta equity: ${account_equity:.2f}\n"
-            f"Mercado abierto según Alpaca: {clock.get('is_open')}\n"
-            f"Hora Nueva York: {now_ny.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            "La ejecución manual no envía órdenes."
-        )
+        run_diagnostics(now_ny)
         save_state(state)
         return
 
@@ -512,25 +655,29 @@ def main():
         bar_iso = bar_time.tz_convert("UTC").isoformat()
         if bar_iso <= state.get("last_bar", ""):
             continue
-        side = evaluate(row)
+        side, score, checks = analyze(row)
         if side:
-            candidates.append((bar_time, row, side, bar_iso))
+            candidates.append((bar_time, row, side, score, checks, bar_iso))
 
     if not candidates:
+        last = enriched.iloc[-1]
+        print(f"Sin señal. Cierre {last['close']:.2f}, RSI {last['rsi']:.1f}, ADX {last['adx']:.1f}.")
         save_state(state)
         return
 
-    bar_time, row, side, bar_iso = candidates[-1]
+    bar_time, row, side, score, checks, bar_iso = candidates[-1]
+    # From here on this bar is consumed, whatever happens next.
+    state["last_bar"] = bar_iso
+
     signal_price = float(row["close"])
     atr = float(row["atr"])
     stop_distance = atr * ATR_MULT
     latest_price = float(enriched["close"].iloc[-1])
 
     if abs(latest_price - signal_price) > MAX_DRIFT_ATR * stop_distance:
-        state["last_bar"] = bar_iso
         telegram(
             "⏰ Señal descartada por movimiento tardío\n"
-            f"NVDA {side}; señal {signal_price:.2f}, último cierre {latest_price:.2f}.\n"
+            f"{SYMBOL} {side}; señal {signal_price:.2f}, último cierre {latest_price:.2f}.\n"
             "No se envió ninguna orden."
         )
         save_state(state)
@@ -548,28 +695,77 @@ def main():
         return
 
     equity, buying_power = get_account()
-    risk_dollars = equity * (RISK_PCT / 100.0)
-    max_notional = equity * (MAX_NOTIONAL_PCT / 100.0)
-    qty_by_risk = math.floor(risk_dollars / stop_distance)
-    qty_by_notional = math.floor(max_notional / signal_price)
-    qty_by_buying_power = math.floor(buying_power / signal_price)
-    qty = min(qty_by_risk, qty_by_notional, qty_by_buying_power)
-
+    qty, risk_dollars = position_size(equity, buying_power, latest_price, stop_distance)
     if qty < 1:
         telegram(
-            "⚠️ Señal NVDA omitida: el tamaño calculado es menor a 1 acción.\n"
+            f"⚠️ Señal {SYMBOL} omitida: el tamaño calculado es menor a 1 acción.\n"
             f"Equity ${equity:.2f}; riesgo objetivo ${risk_dollars:.2f}; "
             f"distancia stop ${stop_distance:.2f}."
         )
-        state["last_bar"] = bar_iso
         save_state(state)
         return
 
+    stop_price, tp_price = compute_levels(side, latest_price, stop_distance)
+    signal_text = format_signal(
+        side, bar_time, row, score, checks, latest_price, stop_price, tp_price, qty, risk_dollars
+    )
+    # Persist before the (long) approval wait so a crash cannot re-ask for the same bar.
+    save_state(state)
 
-    if side == "LONG":
-        stop_price = round(signal_price - stop_distance, 2)
-        tp_price = round(signal_price + stop_distance * RR, 2)
-    else:
-        stop_price = round(signal_price + stop_distance, 2)
-        tp_price = round(signal_price - stop_distance * RR, 2)
-        
+    decision = ask_approval(signal_text)
+    if decision != "approve":
+        print(f"Decisión: {decision}. No se opera.")
+        return
+
+    # Re-validate everything after the human delay: price, market, existing exposure.
+    if not get_clock().get("is_open", False):
+        telegram("⚠️ El mercado cerró mientras esperaba la aprobación. No se envió la orden.")
+        return
+    busy, reason = has_position_or_open_order()
+    if busy:
+        telegram(f"⚠️ {reason} No se envió la orden.")
+        return
+    entry_now = get_latest_price()
+    if abs(entry_now - signal_price) > MAX_DRIFT_ATR * stop_distance:
+        telegram(
+            f"⚠️ El precio se movió demasiado durante la aprobación ({signal_price:.2f} → {entry_now:.2f}).\n"
+            "Orden cancelada por seguridad."
+        )
+        return
+
+    # Rebuild the bracket around the current price so Alpaca accepts the legs and
+    # the planned risk per share stays identical.
+    equity, buying_power = get_account()
+    qty, _ = position_size(equity, buying_power, entry_now, stop_distance)
+    if qty < 1:
+        telegram("⚠️ Tamaño de posición menor a 1 acción tras la aprobación. No se operó.")
+        return
+    stop_price, tp_price = compute_levels(side, entry_now, stop_distance)
+
+    client_order_id = f"bot-{SYMBOL}-{bar_time.strftime('%Y%m%d%H%M')}-{secrets.token_hex(3)}"
+    try:
+        order = send_order(side, qty, stop_price, tp_price, client_order_id)
+    except requests.HTTPError as exc:
+        body = exc.response.text[:300] if exc.response is not None else str(exc)
+        telegram(f"❌ Alpaca rechazó la orden: {body}")
+        raise
+
+    state["count"] = state.get("count", 0) + 1
+    save_state(state)
+
+    order = wait_for_fill(order["id"])
+    fill = order.get("filled_avg_price")
+    telegram(
+        f"🚀 Orden enviada a Alpaca PAPER — {SYMBOL} {side}\n"
+        f"Estado: {order.get('status')}\n"
+        f"Cantidad: {qty}\n"
+        f"Precio de ejecución: {('$' + format(float(fill), '.2f')) if fill else 'pendiente'}\n"
+        f"🛑 Stop loss: ${stop_price:.2f}\n"
+        f"🎯 Take profit: ${tp_price:.2f}\n"
+        f"Operaciones hoy: {state['count']}/{MAX_TRADES_DAY}\n"
+        f"ID: {client_order_id}"
+    )
+
+
+if __name__ == "__main__":
+    main()
