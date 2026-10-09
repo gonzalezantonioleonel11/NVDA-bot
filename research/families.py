@@ -110,6 +110,100 @@ def orb_range(markets, costs, top_n=3, confirm=1):
                    pd.DataFrame(trades))
 
 
+# --------------------------------------------------------------------------- false-breakout filters
+FILTERS = [
+    ("base", {}),
+    ("volumen>=1.5x", {"vol": 1.5}),
+    ("volumen>=2x", {"vol": 2.0}),
+    ("decidida 10%", {"buf": 0.10}),
+    ("decidida 25%", {"buf": 0.25}),
+    ("a favor del mercado", {"mkt": True}),
+    ("a favor de la tendencia", {"trend": True}),
+    ("a favor del gap", {"gap": True}),
+    ("rango<=0.5 ATR", {"width": 0.5}),
+    ("rango<=0.35 ATR", {"width": 0.35}),
+    ("hasta 10:30", {"until": 10 * 60 + 30}),
+    ("hasta 11:00", {"until": 11 * 60}),
+]
+
+
+def _session_vwap(m):
+    tp = (m.H + m.L + m.C) / 3
+    vwap = np.empty_like(tp)
+    for a, b in zip(m.day_first, m.day_last):
+        vwap[a:b + 1] = np.cumsum(tp[a:b + 1] * m.V[a:b + 1]) / np.maximum(np.cumsum(m.V[a:b + 1]), 1e-9)
+    return vwap
+
+
+def orb_filters(markets, costs, top_n=3):
+    """The live configuration (ORB15, stop at the other end, exit at the close, top 3 by relative
+    volume, first 1-minute close outside the range) with one false-breakout filter at a time.
+    A breakout that fails the filter is ignored and the bot keeps watching for one that passes."""
+    ranges = {s: _opening_range(m, 15) for s, m in markets.items()}
+    spy = markets.get("SPY")
+    spy_vwap = _session_vwap(spy) if spy is not None else None
+    daily = {}
+    for s, m in markets.items():
+        prev_close = np.r_[np.nan, m.day_close[:-1]]
+        sma20 = pd.Series(m.day_close).rolling(20).mean().shift(1).to_numpy()
+        daily[s] = (prev_close, sma20)
+    for name, f in FILTERS:
+        cands = []
+        for s, m in markets.items():
+            rows, rvol = ranges[s]
+            for di, r in enumerate(rows):
+                if not r or not np.isfinite(rvol[di]):
+                    continue
+                if "width" in f and not (np.isfinite(m.atr14[di]) and (r[3] - r[4]) <= f["width"] * m.atr14[di]):
+                    continue
+                cands.append((m.days[di], rvol[di], s, di))
+        trades = []
+        for _, rank, s, di in _top_per_day(cands, top_n):
+            m = markets[s]
+            a, b, o0, hi, lo, c0, vol = ranges[s][0][di]
+            e = m.flat_i[di]
+            k1 = m.minute_index(di, f.get("until", 12 * 60))
+            if k1 <= b:
+                continue
+            close = m.C[b:k1]
+            buf = f.get("buf", 0.0) * (hi - lo)
+            long_ok, short_ok = close > hi + buf, close < lo - buf
+            if "vol" in f:
+                loud = m.V[b:k1] >= f["vol"] * vol / (b - a)
+                long_ok, short_ok = long_ok & loud, short_ok & loud
+            if f.get("mkt") and spy is not None:
+                idx = np.minimum(np.searchsorted(spy.t, m.t[b:k1]), len(spy.t) - 1)
+                same = spy.t[idx] == m.t[b:k1]
+                long_ok &= same & (spy.C[idx] > spy_vwap[idx])
+                short_ok &= same & (spy.C[idx] < spy_vwap[idx])
+            prev_close, sma20 = daily[s]
+            if f.get("trend"):
+                if not np.isfinite(sma20[di]):
+                    continue
+                long_ok &= prev_close[di] > sma20[di]
+                short_ok &= prev_close[di] < sma20[di]
+            if f.get("gap"):
+                if not np.isfinite(prev_close[di]):
+                    continue
+                long_ok &= m.day_open[di] > prev_close[di]
+                short_ok &= m.day_open[di] < prev_close[di]
+            hits = np.flatnonzero(long_ok | short_ok)
+            if not hits.size:
+                continue
+            j = b + int(hits[0]) + 1
+            side = 1 if long_ok[hits[0]] else -1
+            if j >= e:
+                continue
+            fill = m.O[j] * (1 + side * costs.entry_bps / 1e4)
+            stop = lo if side == 1 else hi
+            dist = side * (fill - stop)
+            if dist < MIN_STOP * fill:
+                continue
+            jo, px, why = exit_trade(m, j, e, side, fill, stop, None, False, costs)
+            trades.append(record(m, di, side, fill, dist, j, jo, px, why, rank))
+        yield name, pd.DataFrame(trades)
+
+
 # --------------------------------------------------------------------------- Noise-area intraday momentum
 def _noise_inputs(m, every):
     """Check minutes (bar closing at 10:00, 10:30... or 10:00, 11:00...), sigma per check, VWAP."""
@@ -249,6 +343,7 @@ FAMILIES = {
     "ORB5": orb5,
     "ORB15/30": orb_range,
     "ORB15/30-2velas": lambda markets, costs: orb_range(markets, costs, confirm=2),
+    "ORB15-filtros": orb_filters,
     "Ruido": noise_momentum,
     "Actual": current_strategy,
 }
