@@ -1,0 +1,74 @@
+name: research
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Fecha de inicio de los datos (AAAA-MM-DD)"
+        default: "2017-01-01"
+        required: true
+      symbols:
+        description: "Símbolos separados por coma (vacío = lista por defecto)"
+        default: ""
+      families:
+        description: "Familias separadas por coma (vacío = todas)"
+        default: ""
+      feed:
+        description: "Datos: sip (mercado completo) o iex"
+        type: choice
+        options:
+          - sip
+          - iex
+        default: sip
+
+permissions:
+  contents: read
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install pandas requests numpy
+
+      - name: Semana actual (para la caché de datos)
+        id: week
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Caché de velas
+        uses: actions/cache@v4
+        with:
+          path: research/cache
+          key: research-bars-v1-${{ inputs.feed }}-${{ inputs.start }}-${{ steps.week.outputs.week }}
+          restore-keys: |
+            research-bars-v1-${{ inputs.feed }}-${{ inputs.start }}-
+
+      - name: Ejecutar investigación
+        env:
+          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+          START: ${{ inputs.start }}
+          SYMBOLS: ${{ inputs.symbols }}
+          FAMILIES: ${{ inputs.families }}
+          FEED: ${{ inputs.feed }}
+        run: |
+          args=(--start "$START" --feed "$FEED")
+          if [ -n "$SYMBOLS" ]; then args+=(--symbols "$SYMBOLS"); fi
+          if [ -n "$FAMILIES" ]; then args+=(--families "$FAMILIES"); fi
+          python -m research.run "${args[@]}"
+
+      - name: Guardar resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research_out
+          path: research/out
+          if-no-files-found: ignore
