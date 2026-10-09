@@ -572,4 +572,35 @@ def main():
     else:
         stop_price = round(signal_price + stop_distance, 2)
         tp_price = round(signal_price - stop_distance * RR, 2)
-        
+
+    hora = (bar_time + pd.Timedelta(minutes=5)).strftime("%H:%M")
+    titulo = "COMPRAR (LONG)" if side == "LONG" else "VENDER EN CORTO (SHORT)"
+    signal_text = (
+        f"📈 {titulo} NVDA (PAPER)\n"
+        f"Señal de la vela de las {hora} (hora NY)\n"
+        f"Cantidad: {qty}\n"
+        f"Precio señal: {signal_price:.2f} (último cierre {latest_price:.2f})\n"
+        f"STOP LOSS: {stop_price:.2f}\n"
+        f"TAKE PROFIT: {tp_price:.2f}"
+    )
+
+    # Mark the bar as handled before asking, so the same signal is never re-sent.
+    state["last_bar"] = bar_iso
+    save_state(state)
+
+    decision = ask_approval(signal_text)
+    if decision != "approve":
+        print(f"Operación no aprobada: {decision}.")
+        return
+
+    order = send_order(side, qty, stop_price, tp_price)
+    state["count"] = state.get("count", 0) + 1
+    save_state(state)
+    telegram(
+        f"✅ Orden enviada a Alpaca PAPER\n"
+        f"ID: {order.get('id')}\nEstado: {order.get('status')}"
+    )
+
+
+if __name__ == "__main__":
+    main()
