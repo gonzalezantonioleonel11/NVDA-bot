@@ -44,7 +44,8 @@ UNIVERSE = [
 ]
 OR_MINUTES = 15           # rango de apertura: primeros 15 minutos
 BOTH_SIDES = True         # True: ruptura hacia cualquier lado; False: solo en la dirección de la primera vela
-CONFIRM_BARS = 2          # velas de 1 minuto seguidas que tienen que cerrar fuera del rango antes de entrar
+CONFIRM_BARS = 1          # velas de 1 minuto seguidas que tienen que cerrar fuera del rango antes de entrar
+                          # (2 se probó en research/: mismos aciertos, algo menos de ganancia promedio)
 TOP_N = 3                 # acciones por día (las de mayor volumen relativo)
 RVOL_MIN = 0.0            # mínimo de volumen del rango vs. su promedio de 14 sesiones (0 = siempre las TOP_N)
 STOP_MODE = "opp"         # "opp": otro extremo del rango; "mid": mitad del rango; "atr10": 10% del ATR diario
@@ -272,8 +273,9 @@ def run_session():
         print(f"Ya se operaron hoy: {', '.join(sorted(already))}; sigue solo con el resto.")
     else:
         bot.telegram("\n".join([f"🎯 {NAME} en juego hoy ({len(cands)}):"] + [describe(c) for c in cands] + [
-            f"Entra cuando {CONFIRM_BARS} vela(s) de 1 minuto seguidas cierren fuera del rango "
-        f"(hasta las {deadline:%H:%M} NY)."]))
+            ("Entra cuando una vela de 1 minuto cierre fuera del rango" if CONFIRM_BARS == 1 else
+         f"Entra cuando {CONFIRM_BARS} velas de 1 minuto seguidas cierren fuera del rango")
+        + f" (hasta las {deadline:%H:%M} NY)."]))
 
     pending = {c["sym"]: c for c in cands if c["sym"] not in already}
     while pending and pd.Timestamp.now(tz=NY) < deadline:
