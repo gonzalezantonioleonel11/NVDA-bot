@@ -133,21 +133,32 @@ def stop_trigger(m, k0, k1, level_long=None, level_short=None, costs=None):
     return best
 
 
-def close_trigger(m, k0, k1, level_long=None, level_short=None, costs=None):
-    """Breakout confirmed by a 1-minute close beyond the level, entered at the next minute's open.
+def first_run(mask, n):
+    """Index where the first run of n consecutive True values ends, or None."""
+    if n <= 1:
+        hit = np.flatnonzero(mask)
+        return int(hit[0]) if hit.size else None
+    runs = np.convolve(mask.astype(np.int64), np.ones(n, dtype=np.int64), mode="valid")
+    hit = np.flatnonzero(runs == n)
+    return int(hit[0]) + n - 1 if hit.size else None
+
+
+def close_trigger(m, k0, k1, level_long=None, level_short=None, costs=None, confirm=1):
+    """Breakout confirmed by `confirm` consecutive 1-minute closes beyond the level, entered at
+    the next minute's open.
 
     Returns (entry minute, side, fill, intrabar=False) or None. Unlike a resting stop order this
     needs no assumption about the path inside a bar, and the live bot can do exactly the same.
     """
     best = None
     if level_long is not None:
-        hit = np.flatnonzero(m.C[k0:k1] > level_long)
-        if hit.size:
-            best = (k0 + int(hit[0]), 1)
+        i = first_run(m.C[k0:k1] > level_long, confirm)
+        if i is not None:
+            best = (k0 + i, 1)
     if level_short is not None:
-        hit = np.flatnonzero(m.C[k0:k1] < level_short)
-        if hit.size and (best is None or k0 + int(hit[0]) < best[0]):
-            best = (k0 + int(hit[0]), -1)
+        i = first_run(m.C[k0:k1] < level_short, confirm)
+        if i is not None and (best is None or k0 + i < best[0]):
+            best = (k0 + i, -1)
     if best is None:
         return None
     j, side = best[0] + 1, best[1]

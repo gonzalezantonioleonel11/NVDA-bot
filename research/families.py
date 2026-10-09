@@ -78,8 +78,9 @@ def orb5(markets, costs, top_n=3):
 
 
 # --------------------------------------------------------------------------- ORB 15 / 30 minutes
-def orb_range(markets, costs, top_n=3):
-    """Classic opening range breakout on both sides (confirmed by a 1-minute close), until 12:00."""
+def orb_range(markets, costs, top_n=3, confirm=1):
+    """Classic opening range breakout on both sides, confirmed by `confirm` consecutive 1-minute
+    closes outside the range, until 12:00."""
     for minutes in (15, 30):
         ranges = {s: _opening_range(m, minutes) for s, m in markets.items()}
         for stop_mode, tp_r, rv_min in itertools.product(("opp", "mid"), (None, 2.0), (0.0, 1.2)):
@@ -94,7 +95,7 @@ def orb_range(markets, costs, top_n=3):
                 m = markets[s]
                 a, b, o0, hi, lo, c0, _ = ranges[s][0][di]
                 e = m.flat_i[di]
-                got = close_trigger(m, b, m.minute_index(di, 12 * 60), hi, lo, costs)
+                got = close_trigger(m, b, m.minute_index(di, 12 * 60), hi, lo, costs, confirm)
                 if got is None:
                     continue
                 j, side, fill, intrabar = got
@@ -247,6 +248,7 @@ def current_strategy(markets, costs):
 FAMILIES = {
     "ORB5": orb5,
     "ORB15/30": orb_range,
+    "ORB15/30-2velas": lambda markets, costs: orb_range(markets, costs, confirm=2),
     "Ruido": noise_momentum,
     "Actual": current_strategy,
 }
