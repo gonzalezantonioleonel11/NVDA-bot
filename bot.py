@@ -42,15 +42,19 @@ HEADERS = {
 SESSION = requests.Session()
 
 
+
 def telegram(message):
     if not TG_TOKEN or not TG_CHAT:
-        print(message)
-        return
-    response = SESSION.post(
+        raise RuntimeError("Falta TELEGRAM_TOKEN o TELEGRAM_CHAT_ID")
+
+    response = requests.post(
         f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
         json={"chat_id": TG_CHAT, "text": message},
         timeout=20,
     )
+
+    print("Telegram HTTP:", response.status_code)
+    print("Telegram respuesta:", response.text[:500])
     response.raise_for_status()
 
 
