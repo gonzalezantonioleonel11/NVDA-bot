@@ -69,6 +69,35 @@ def daily_t(trades, start, end, risk=0.01):
     return float(d.mean() / d.std(ddof=1) * np.sqrt(len(d))) if d.std(ddof=1) > 0 else 0.0
 
 
+def weeks_total(tr):
+    days = pd.to_datetime(pd.Series(tr["day"]))
+    return max((days.max() - days.min()).days / 7, 1)
+
+
+def compare_to_base(variants, windows, weeks, final):
+    """Each filter against the unfiltered 'base' variant: hit rate, R per trade, and in how many
+    quarters (out of sample windows) its total R beat the base."""
+    base = variants["base"]
+    base_mi = month_index(base)
+    rows = ["", "| Filtro | Ops/sem | Aciertos | R prom. | R total | PF | t | Trimestres mejor que base |",
+            "|---|---|---|---|---|---|---|---|"]
+    final.append("   Comparación de filtros (período completo; trimestres = cuántos de los fuera de muestra supera a la base):")
+    for name, tr in variants.items():
+        st = engine.trade_stats(tr)
+        better = 0
+        if len(tr):
+            mi = month_index(tr)
+            for _, test_start, test_end in windows:
+                r_var = tr["r"][(mi >= test_start) & (mi < test_end)].sum()
+                r_base = base["r"][(base_mi >= test_start) & (base_mi < test_end)].sum()
+                better += r_var > r_base
+        line = (f"{st['n'] / weeks:.1f} | {st['wr']:.0f}% | {st['exp']:+.3f} | {st['R']:+.1f} | {st['pf']:.2f} | "
+                f"{st['t']:.2f} | {better if name != 'base' else '-'}/{len(windows)}")
+        rows.append(f"| {name} | {line} |")
+        final.append(f"     {name:24s} {line.replace(' | ', '  ')}")
+    return rows
+
+
 def checks(st, st_stress, weeks, t_daily, picks):
     per_week = st["n"] / weeks if weeks else 0
     pos_windows = sum(1 for p in picks if p[3] > 0) / len(picks) * 100 if picks else 0
@@ -173,6 +202,8 @@ def main():
                              f"CAGR {ms['cagr']:+.1f}% maxDD {ms['max_dd']:.1f}%")
             for window, name, n, r in picks:
                 final.append(f"   {window}: {name or '-'} -> {n} ops, R {r:+.1f}")
+        if "base" in base:
+            lines += compare_to_base(base, windows, weeks_total(base["base"]), final)
         lines.append("")
 
     pd.DataFrame(all_variants).to_csv(os.path.join(OUT_DIR, "variantes.csv"), index=False)
