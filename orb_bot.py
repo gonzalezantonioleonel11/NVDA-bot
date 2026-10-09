@@ -319,15 +319,26 @@ def flatten_and_report(session_open):
     for sym in symbols:
         if bot.api("GET", f"/v2/positions/{sym}", allow_404=True):
             bot.api("DELETE", f"/v2/positions/{sym}", allow_404=True)
-    time.sleep(8)
+    # Wait until the closing orders have really filled before adding up the results.
+    for _ in range(45):
+        if not open_positions(symbols):
+            break
+        time.sleep(2)
     report(session_open, symbols)
 
 
+def open_positions(symbols):
+    return {p["symbol"]: p for p in bot.api("GET", "/v2/positions") or [] if p["symbol"] in symbols}
+
+
 def report(session_open, symbols):
+    """Result per symbol: realized from today's fills for closed ones; open ones are listed apart
+    with their unrealized result, because a half-closed position's cash flow is not a result."""
+    still_open = open_positions(symbols)
     fills = bot.api("GET", "/v2/account/activities/FILL", params={"date": session_open.strftime("%Y-%m-%d")}) or []
     pnl = {}
     for f in fills:
-        if f.get("symbol") in symbols:
+        if f.get("symbol") in symbols and f["symbol"] not in still_open:
             sign = -1 if f["side"] == "buy" else 1
             pnl[f["symbol"]] = pnl.get(f["symbol"], 0.0) + sign * float(f["qty"]) * float(f["price"])
     account = bot.api("GET", "/v2/account")
@@ -341,10 +352,18 @@ def report(session_open, symbols):
     lines.append(f"Resultado del día (cuenta): {bot.money(equity - last_equity)} ({(equity / last_equity - 1) * 100:+.2f}%)")
     lines.append(f"Equity: ${equity:,.2f}")
     write_journal(session_open, pnl, equity - last_equity, equity)
-    still_open = [p["symbol"] for p in bot.api("GET", "/v2/positions") or [] if p["symbol"] in symbols]
     if still_open:
-        lines.append("⚠️ Quedaron posiciones abiertas: " + ", ".join(still_open) + ". Revisalas en Alpaca.")
+        lines.append("⚠️ Quedaron posiciones abiertas (no se pudieron cerrar): " + ", ".join(
+            f"{sym} {bot.money(float(p['unrealized_pl']))}" for sym, p in still_open.items()) + ". Revisalas en Alpaca.")
     bot.telegram("\n".join(lines))
+
+
+def journal_has(date):
+    """Whether the journal (synced from main by the workflow) already has this day's report."""
+    if not os.path.exists(JOURNAL):
+        return False
+    with open(JOURNAL, encoding="utf-8") as file:
+        return any(row and row[0] == date for row in csv.reader(file))
 
 
 def write_journal(session_open, pnl, day_pnl, equity):
@@ -370,11 +389,9 @@ def run_close():
     if session_close.hour < 15 or not (flatten_at - pd.Timedelta(minutes=40) <= now <= session_close):
         print(f"Fuera de la ventana de cierre ({now:%H:%M} NY); sale sin hacer nada.")
         return
-    if now > flatten_at + pd.Timedelta(seconds=30):
-        symbols = {o["symbol"] for o in our_orders(session_open)}
-        if not any(p["symbol"] in symbols for p in bot.api("GET", "/v2/positions") or []):
-            print("Ya se cerró y se informó hoy; sale sin repetir el resumen.")
-            return
+    if journal_has(session_open.strftime("%Y-%m-%d")):
+        print("El resumen de hoy ya está en el registro; sale sin repetirlo.")
+        return
     wait_until(flatten_at)
     flatten_and_report(session_open)
 

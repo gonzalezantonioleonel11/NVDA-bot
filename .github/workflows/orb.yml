@@ -48,6 +48,14 @@ jobs:
       - name: Instalar dependencias
         run: pip install pandas requests
 
+      - name: Traer el registro más reciente
+        # The job runs on the commit it was scheduled with; the journal may be newer on main.
+        run: |
+          git fetch -q origin main
+          if git cat-file -e origin/main:orb_journal.csv 2>/dev/null; then
+            git show origin/main:orb_journal.csv > orb_journal.csv
+          fi
+
       - name: Ejecutar bot ORB (PAPER)
         env:
           ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
@@ -72,13 +80,16 @@ jobs:
       - name: Guardar registro de operaciones
         if: always()
         run: |
-          if [ -f orb_journal.csv ]; then
-            git add orb_journal.csv
-            if ! git diff --cached --quiet; then
-              git config user.name "nvda-bot"
-              git config user.email "bot@users.noreply.github.com"
-              git commit -m "Registro ORB5 del día"
-              git pull --rebase --autostash
-              git push
-            fi
+          [ -f orb_journal.csv ] || exit 0
+          git fetch -q origin main
+          if git cat-file -e origin/main:orb_journal.csv 2>/dev/null && git diff --quiet origin/main -- orb_journal.csv; then
+            exit 0  # nothing new
           fi
+          cp orb_journal.csv "$RUNNER_TEMP/orb_journal.csv"
+          git checkout -q -f -B main origin/main
+          cp "$RUNNER_TEMP/orb_journal.csv" orb_journal.csv
+          git config user.name "nvda-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add orb_journal.csv
+          git commit -q -m "Registro ORB del día"
+          git push -q origin main
