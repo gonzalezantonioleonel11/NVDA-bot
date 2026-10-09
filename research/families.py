@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 import bot
+import sectors
 from research.engine import MIN_STOP, close_trigger, exit_trade, record
 
 OPEN = 9 * 60 + 30
@@ -28,16 +29,19 @@ def _opening_range(m, minutes):
     return out, rvol
 
 
-def _top_per_day(cands, n):
-    """Keep the n candidates with the highest relative volume each day."""
+def _top_per_day(cands, n, per_sector=None):
+    """Keep the n candidates with the highest relative volume each day, optionally at most
+    `per_sector` of them from the same sector (the next one in another sector takes its place)."""
     cands.sort(key=lambda c: (c[0], -c[1]))
-    out, last_day, count = [], None, 0
+    out, last_day, count, used = [], None, 0, {}
     for c in cands:
         if c[0] != last_day:
-            last_day, count = c[0], 0
-        if count < n:
+            last_day, count, used = c[0], 0, {}
+        group = sectors.sector(c[2])
+        if count < n and (per_sector is None or used.get(group, 0) < per_sector):
             out.append(c)
             count += 1
+            used[group] = used.get(group, 0) + 1
     return out
 
 
@@ -124,6 +128,8 @@ FILTERS = [
     ("rango<=0.35 ATR", {"width": 0.35}),
     ("hasta 10:30", {"until": 10 * 60 + 30}),
     ("hasta 11:00", {"until": 11 * 60}),
+    ("una por sector", {"sector": 1}),
+    ("máx. 2 por sector", {"sector": 2}),
 ]
 
 
@@ -158,7 +164,7 @@ def orb_filters(markets, costs, top_n=3):
                     continue
                 cands.append((m.days[di], rvol[di], s, di))
         trades = []
-        for _, rank, s, di in _top_per_day(cands, top_n):
+        for _, rank, s, di in _top_per_day(cands, top_n, f.get("sector")):
             m = markets[s]
             a, b, o0, hi, lo, c0, vol = ranges[s][0][di]
             e = m.flat_i[di]
