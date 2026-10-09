@@ -4,8 +4,8 @@ Bot de day trading por ruptura del rango de apertura (ORB) en Alpaca PAPER.
 Cada día, al terminar el rango de apertura (por defecto los primeros 15 minutos), elige las
 acciones "en juego": las de mayor volumen relativo en ese rango dentro del universo. Opera la
 primera ruptura confirmada (una vela de 1 minuto que cierra fuera del rango) con el stop-loss
-y el take profit puestos en Alpaca, y cierra todo 10 minutos antes del cierre. Es la
-configuración que mejor salió en research/ (ver el informe del workflow "research").
+en el otro extremo del rango puesto en Alpaca, y cierra todo 10 minutos antes del cierre. Es la
+variante más consistente en research/ con datos SIP e IEX (ver el workflow "research").
 
 Modos (los elige el workflow orb.yml):
   python orb_bot.py session     ~9:00-12:00 NY: selección y entradas (en media jornada también cierra)
@@ -41,9 +41,9 @@ UNIVERSE = [
 OR_MINUTES = 15           # rango de apertura: primeros 15 minutos
 BOTH_SIDES = True         # True: ruptura hacia cualquier lado; False: solo en la dirección de la primera vela
 TOP_N = 3                 # acciones por día (las de mayor volumen relativo)
-RVOL_MIN = 1.2            # volumen del rango vs. su promedio de 14 sesiones
-STOP_MODE = "mid"         # "mid": mitad del rango; "opp": otro extremo del rango; "atr10": 10% del ATR diario
-TP_R = 2.0                # take profit en múltiplos del riesgo (None = sin TP, sale al cierre)
+RVOL_MIN = 0.0            # mínimo de volumen del rango vs. su promedio de 14 sesiones (0 = siempre las TOP_N)
+STOP_MODE = "opp"         # "opp": otro extremo del rango; "mid": mitad del rango; "atr10": 10% del ATR diario
+TP_R = None               # take profit en múltiplos del riesgo (None = sin TP, sale al cierre)
 RISK_PCT = 1.0            # % del equity arriesgado por operación
 LEV_CAP = 4.0             # exposición total máxima (x equity), repartida entre TOP_N posiciones
 ENTRY_DEADLINE_MIN = 12 * 60   # no abre operaciones después de las 12:00 NY
@@ -357,8 +357,10 @@ def run_diagnostic():
     now = pd.Timestamp.now(tz=NY)
     account = bot.api("GET", "/v2/account")
     lines = [f"🧪 Diagnóstico {NAME} (PAPER, no opera)", f"Equity: ${float(account['equity']):,.2f}",
-             f"Universo: {len(UNIVERSE)} símbolos | top {TOP_N} por volumen relativo >= {RVOL_MIN}",
-             f"Stop: {STOP_MODE} | TP: {TP_R or 'ninguno'}R | riesgo {RISK_PCT}% por operación | entradas hasta "
+             f"Universo: {len(UNIVERSE)} símbolos | top {TOP_N} por volumen relativo"
+             + (f" (mínimo x{RVOL_MIN})" if RVOL_MIN else ""),
+             f"Stop: {STOP_MODE} | TP: {f'{TP_R}R' if TP_R else 'ninguno, sale al cierre'} | riesgo {RISK_PCT}% "
+             f"por operación | entradas hasta "
              f"{ENTRY_DEADLINE_MIN // 60}:{ENTRY_DEADLINE_MIN % 60:02d} NY"]
     past = [s for s in sessions((now - pd.Timedelta(days=10)).strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d"))
             if s[0] + pd.Timedelta(minutes=OR_MINUTES) <= now]
