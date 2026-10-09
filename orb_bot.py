@@ -44,6 +44,8 @@ UNIVERSE = [
 ]
 OR_MINUTES = 15           # rango de apertura: primeros 15 minutos
 BOTH_SIDES = True         # True: ruptura hacia cualquier lado; False: solo en la dirección de la primera vela
+CONFIRM_BARS = 1          # velas de 1 minuto seguidas que tienen que cerrar fuera del rango antes de entrar
+                          # (2 se probó en research/: mismos aciertos, algo menos de ganancia promedio)
 TOP_N = 3                 # acciones por día (las de mayor volumen relativo)
 RVOL_MIN = 0.0            # mínimo de volumen del rango vs. su promedio de 14 sesiones (0 = siempre las TOP_N)
 STOP_MODE = "opp"         # "opp": otro extremo del rango; "mid": mitad del rango; "atr10": 10% del ATR diario
@@ -199,19 +201,25 @@ def enter(c, side, price, equity, today):
             f"   Stop {stop:.2f} (riesgo ${qty * dist:,.0f}){tp_text}")
 
 
+def first_run(flags, n):
+    """Position where the first run of n consecutive True values ends, or None."""
+    run = 0
+    for i, flag in enumerate(flags):
+        run = run + 1 if flag else 0
+        if run >= n:
+            return i
+    return None
+
+
 def breakout(c, df):
-    """First 1-minute close outside the range -> (side, latest close, minute of the breakout) or None."""
-    up = df["c"] > c["high"]
-    down = df["c"] < c["low"]
-    if c["side"] == 1:
-        down[:] = False
-    elif c["side"] == -1:
-        up[:] = False
-    hits = df[up | down]
-    if hits.empty:
+    """CONFIRM_BARS consecutive 1-minute closes outside the range -> (side, latest close, confirming minute)."""
+    up = (df["c"] > c["high"]).tolist() if c["side"] != -1 else []
+    down = (df["c"] < c["low"]).tolist() if c["side"] != 1 else []
+    i_up, i_down = first_run(up, CONFIRM_BARS), first_run(down, CONFIRM_BARS)
+    if i_up is None and i_down is None:
         return None
-    first = hits.index[0]
-    return (1 if up[first] else -1), float(df["c"].iloc[-1]), first
+    side, i = (1, i_up) if i_down is None or (i_up is not None and i_up <= i_down) else (-1, i_down)
+    return side, float(df["c"].iloc[-1]), df.index[i]
 
 
 # ------------------------------------------------------------------ sesiones
@@ -265,7 +273,9 @@ def run_session():
         print(f"Ya se operaron hoy: {', '.join(sorted(already))}; sigue solo con el resto.")
     else:
         bot.telegram("\n".join([f"🎯 {NAME} en juego hoy ({len(cands)}):"] + [describe(c) for c in cands] + [
-            f"Entra cuando una vela de 1 minuto cierre fuera del rango (hasta las {deadline:%H:%M} NY)."]))
+            ("Entra cuando una vela de 1 minuto cierre fuera del rango" if CONFIRM_BARS == 1 else
+         f"Entra cuando {CONFIRM_BARS} velas de 1 minuto seguidas cierren fuera del rango")
+        + f" (hasta las {deadline:%H:%M} NY)."]))
 
     pending = {c["sym"]: c for c in cands if c["sym"] not in already}
     while pending and pd.Timestamp.now(tz=NY) < deadline:
