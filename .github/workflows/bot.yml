@@ -36,6 +36,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_APPROVER_ID: ${{ secrets.TELEGRAM_APPROVER_ID }}
           MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+          TRADE_SIDES: ${{ vars.TRADE_SIDES || 'BOTH' }}
         run: python bot.py
 
       - name: Guardar estado

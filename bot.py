@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import math
 import time
@@ -8,6 +9,8 @@ from datetime import time as dtime
 import pandas as pd
 import requests
 
+import levels as sr
+
 # SAFETY: this version is hard-wired to Alpaca PAPER trading.
 TRADING_URL = "https://paper-api.alpaca.markets"
 DATA_URL = "https://data.alpaca.markets"
@@ -15,10 +18,19 @@ SYMBOL = os.environ.get("SYMBOL", "NVDA").upper()
 NY = "America/New_York"
 STATE_FILE = "estado.json"
 
+# Which directions the bot may propose: BOTH, LONG or SHORT.
+TRADE_SIDES = os.environ.get("TRADE_SIDES", "BOTH").strip().upper() or "BOTH"
+if TRADE_SIDES not in ("BOTH", "LONG", "SHORT"):
+    print(f"TRADE_SIDES={TRADE_SIDES!r} no es válido; se usa BOTH.")
+    TRADE_SIDES = "BOTH"
+
 # Risk controls
 RISK_PCT = 0.5                 # risk budget as % of account equity per trade
-ATR_MULT = 1.5                 # stop distance = ATR * this multiplier
+ATR_MULT = 1.5                 # base stop distance = ATR * this multiplier
+MAX_STOP_ATR = 2.5             # a stop moved behind a level is never wider than this
 RR = 2.0                       # take-profit distance = stop distance * this ratio
+MIN_RR = 1.5                   # skip the trade if the next level leaves less room than this
+MIN_RR_AFTER_APPROVAL = 1.2    # re-check with the live price after the human delay
 ADX_MIN = 20
 MAX_TRADES_DAY = 3
 MAX_NOTIONAL_PCT = 20.0        # cap exposure to 20% of equity per position
@@ -28,11 +40,16 @@ ENTRY_END = dtime(15, 20)
 FORCE_FLAT_TIME = dtime(15, 50)
 APPROVAL_TIMEOUT = 180         # seconds to wait for the Telegram button
 
-# Confluence scoring: trend filters are mandatory, then at least MIN_SCORE
-# of the optional confirmations must agree, and at least one must be a trigger.
-MIN_SCORE = 5
+# Confluence scoring: trend filters are mandatory, then at least MIN_SCORE of the
+# 11 confirmations must agree, and at least one of them must be a trigger.
+MIN_SCORE = 6
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
+
+# Present-time market context
+MARKET_SYMBOLS = ("SPY", "QQQ", "SMH")   # S&P 500, Nasdaq 100, semiconductors
+NEWS_HOURS = 24
+NEWS_HOT_MINUTES = 30
 
 KEY = os.environ.get("ALPACA_KEY", "")
 SECRET = os.environ.get("ALPACA_SECRET", "")
@@ -98,29 +115,7 @@ def get_account():
     return equity, buying_power
 
 
-def get_bars():
-    start = (
-        pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=10)
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    url = f"{DATA_URL}/v2/stocks/{SYMBOL}/bars"
-    params = {
-        "timeframe": "5Min",
-        "start": start,
-        "limit": 10000,
-        "adjustment": "raw",
-        "feed": "iex",
-    }
-    bars = []
-    while True:
-        response = SESSION.get(url, headers=HEADERS, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        bars.extend(data.get("bars") or [])
-        token = data.get("next_page_token")
-        if not token:
-            break
-        params["page_token"] = token
-
+def _bars_frame(bars):
     frame = pd.DataFrame(bars)
     if frame.empty:
         return frame
@@ -131,6 +126,38 @@ def get_bars():
     frame = frame.set_index("t")[["open", "high", "low", "close", "volume"]]
     frame = frame[~frame.index.duplicated(keep="last")].sort_index()
     return frame
+
+
+def get_bars_multi(symbols, days=10):
+    start = (
+        pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    params = {
+        "symbols": ",".join(symbols),
+        "timeframe": "5Min",
+        "start": start,
+        "limit": 10000,
+        "adjustment": "raw",
+        "feed": "iex",
+    }
+    collected = {symbol: [] for symbol in symbols}
+    while True:
+        response = SESSION.get(
+            f"{DATA_URL}/v2/stocks/bars", headers=HEADERS, params=params, timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
+        for symbol, bars in (data.get("bars") or {}).items():
+            collected.setdefault(symbol, []).extend(bars or [])
+        token = data.get("next_page_token")
+        if not token:
+            break
+        params["page_token"] = token
+    return {symbol: _bars_frame(bars) for symbol, bars in collected.items()}
+
+
+def get_bars():
+    return get_bars_multi([SYMBOL])[SYMBOL]
 
 
 def get_latest_price():
@@ -145,6 +172,81 @@ def get_latest_price():
     if price <= 0:
         raise RuntimeError("No se pudo obtener el último precio.")
     return price
+
+
+def market_trend(frame, now_utc):
+    """+1 / -1 when the 5-min EMAs and the session VWAP agree, 0 if mixed or no data."""
+    if frame.empty:
+        return 0
+    frame = frame.between_time("09:30", "15:59")
+    frame = frame[frame.index + pd.Timedelta(minutes=5) <= now_utc]
+    if len(frame) < 60:
+        return 0
+    close = frame["close"]
+    ema_fast = close.ewm(span=20, adjust=False).mean().iloc[-1]
+    ema_slow = close.ewm(span=50, adjust=False).mean().iloc[-1]
+    session = frame[frame.index.date == frame.index[-1].date()]
+    volume = session["volume"].sum()
+    if volume <= 0:
+        return 0
+    typical = (session["high"] + session["low"] + session["close"]) / 3
+    vwap = (typical * session["volume"]).sum() / volume
+    last = close.iloc[-1]
+    if ema_fast > ema_slow and last > vwap:
+        return 1
+    if ema_fast < ema_slow and last < vwap:
+        return -1
+    return 0
+
+
+def get_market_context(now_utc):
+    """Trend of SPY/QQQ/SMH right now. Informational: failures return None."""
+    try:
+        frames = get_bars_multi(list(MARKET_SYMBOLS), days=5)
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        print(f"Contexto de mercado no disponible: {exc}")
+        return None
+    return {
+        symbol: market_trend(frames.get(symbol, pd.DataFrame()), now_utc)
+        for symbol in MARKET_SYMBOLS
+    }
+
+
+def get_news(now_utc):
+    """Latest headlines for SYMBOL. Informational: failures return []."""
+    start = (now_utc - pd.Timedelta(hours=NEWS_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        response = SESSION.get(
+            f"{DATA_URL}/v1beta1/news",
+            headers=HEADERS,
+            params={"symbols": SYMBOL, "start": start, "limit": 10, "sort": "desc"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        items = response.json().get("news") or []
+    except (requests.RequestException, ValueError) as exc:
+        print(f"Noticias no disponibles: {exc}")
+        return []
+    news = []
+    for item in items:
+        if not item.get("created_at") or not item.get("headline"):
+            continue
+        news.append({
+            "time": pd.to_datetime(item["created_at"], utc=True),
+            "headline": " ".join(item["headline"].split()),
+            "source": item.get("source", ""),
+        })
+    return news
+
+
+def can_short():
+    account = api("GET", "/v2/account")
+    if not account.get("shorting_enabled", False):
+        return False, "La cuenta no tiene habilitada la venta en corto (requiere margen, equity ≥ $2.000)."
+    asset = api("GET", f"/v2/assets/{SYMBOL}")
+    if not (asset.get("shortable") and asset.get("easy_to_borrow")):
+        return False, f"{SYMBOL} no está disponible para venta en corto en este momento."
+    return True, ""
 
 
 def rma(series, period):
@@ -250,13 +352,18 @@ def add_indicators(frame):
     df["fvg_bear_recent"] = df["fvg_bear"].astype(float).rolling(6, min_periods=1).max().fillna(0).astype(bool)
 
     df["htf_trend"] = add_higher_timeframe_trend(df)
+    df = df.join(sr.fibonacci_columns(df))
 
     return df
 
 
-def side_checks(row, side):
+def side_checks(row, side, ctx=None):
     """Checklist for one side: (mandatory, optional, has_trigger)."""
+    ctx = ctx or {}
     up = side == "LONG"
+    sign = 1 if up else -1
+    market = ctx.get("market")
+
     mandatory = [
         ("ADX > %d (hay tendencia)" % ADX_MIN, row["adx"] > ADX_MIN),
         ("EMA20 %s EMA50" % (">" if up else "<"),
@@ -264,29 +371,50 @@ def side_checks(row, side):
         ("Precio %s VWAP" % ("sobre" if up else "bajo"),
          row["close"] > row["vwap"] if up else row["close"] < row["vwap"]),
         ("Tendencia 1H %s" % ("alcista" if up else "bajista"),
-         row["htf_trend"] == (1 if up else -1)),
+         row["htf_trend"] == sign),
     ]
+    if market:
+        against = sum(1 for value in market.values() if value == -sign)
+        mandatory.append(("Mercado general no está todo en contra", against < len(market)))
+
     rsi_trigger = (
         row["rsi_prev"] <= 45 < row["rsi"] if up else row["rsi_prev"] >= 55 > row["rsi"]
     )
     structure = bool(row["structure_up_recent"] if up else row["structure_down_recent"])
     sweep = bool(row["sweep_bull_recent"] if up else row["sweep_bear_recent"])
+    fib_zone = bool(row["fib_bull_zone"] if up else row["fib_bear_zone"])
+    reaction = (ctx.get("reaction") or {}).get(side, "")
+    if market:
+        favor = [symbol for symbol, value in market.items() if value == sign]
+        market_check = (
+            "Mercado a favor (%d/%d%s)" % (
+                len(favor), len(market), ": " + ", ".join(favor) if favor else ""
+            ),
+            len(favor) >= 2,
+        )
+    else:
+        market_check = ("Mercado general (sin datos)", False)
+
     optional = [
         ("RSI gatillo (cruce %s)" % ("45↑" if up else "55↓"), rsi_trigger),
         ("Estructura BOS/CHoCH reciente", structure),
         ("Barrido de liquidez reciente", sweep),
+        ("Fibonacci: %s en zona dorada 0.5–0.786" % ("rebote" if up else "rechazo"), fib_zone),
+        (reaction or ("Reacción en soporte" if up else "Reacción en resistencia"), bool(reaction)),
         ("FVG reciente", bool(row["fvg_bull_recent"] if up else row["fvg_bear_recent"])),
         ("MACD histograma %s" % ("> 0" if up else "< 0"),
          row["macd_hist"] > 0 if up else row["macd_hist"] < 0),
         ("Sesgo de estructura %s" % ("alcista" if up else "bajista"),
-         row["market_bias"] == (1 if up else -1)),
+         row["market_bias"] == sign),
         ("Volumen sobre promedio", bool(row["vol_ok"])),
         ("RSI sin %s" % ("sobrecompra" if up else "sobreventa"),
          row["rsi"] < RSI_OVERBOUGHT if up else row["rsi"] > RSI_OVERSOLD),
+        market_check,
     ]
     mandatory = [(label, bool(ok)) for label, ok in mandatory]
     optional = [(label, bool(ok)) for label, ok in optional]
-    return mandatory, optional, bool(rsi_trigger or structure or sweep)
+    has_trigger = bool(rsi_trigger or structure or sweep or fib_zone or reaction)
+    return mandatory, optional, has_trigger
 
 
 def data_ready(row):
@@ -295,36 +423,69 @@ def data_ready(row):
     ) and row["atr"] > 0
 
 
-def analyze(row):
+def allowed_sides():
+    return ("LONG", "SHORT") if TRADE_SIDES == "BOTH" else (TRADE_SIDES,)
+
+
+def analyze(row, ctx=None):
     """
-    Returns (side, score, checks) where checks is a list of (label, passed) for the
-    chosen side. side is None when no setup qualifies.
-    Trend filters are mandatory; then at least MIN_SCORE of the 8 confirmations must
-    agree and at least one of them must be a trigger (RSI cross, BOS/CHoCH or sweep).
+    Returns (side, score, (mandatory, optional)). side is None when no setup qualifies.
+    Trend filters are mandatory; then at least MIN_SCORE confirmations must agree and
+    at least one must be a trigger (RSI cross, BOS/CHoCH, sweep, Fibonacci or S/R).
     """
     if not data_ready(row):
-        return None, 0, []
-    best = (None, 0, [])
-    for side in ("LONG", "SHORT"):
-        mandatory, optional, has_trigger = side_checks(row, side)
+        return None, 0, ([], [])
+    best = (None, 0, ([], []))
+    for side in allowed_sides():
+        mandatory, optional, has_trigger = side_checks(row, side, ctx)
         score = sum(ok for _, ok in optional)
         if all(ok for _, ok in mandatory) and has_trigger and score >= MIN_SCORE and score > best[1]:
-            best = (side, score, mandatory + optional)
+            best = (side, score, (mandatory, optional))
     return best
 
 
-def evaluate(row):
-    return analyze(row)[0]
+def evaluate(row, ctx=None):
+    return analyze(row, ctx)[0]
 
 
-def compute_levels(side, entry, stop_distance):
-    if side == "LONG":
-        stop_price = round(entry - stop_distance, 2)
-        tp_price = round(entry + stop_distance * RR, 2)
-    else:
-        stop_price = round(entry + stop_distance, 2)
-        tp_price = round(entry - stop_distance * RR, 2)
-    return stop_price, tp_price
+def build_context(df, market=None):
+    """Levels and level reactions known at the close of df's last bar."""
+    levels = sr.key_levels(df)
+    return {
+        "levels": levels,
+        "reaction": {side: sr.level_reaction(df, levels, side) for side in ("LONG", "SHORT")},
+        "market": market,
+    }
+
+
+def scan(enriched, market=None, last_bar="", lookback=3):
+    """Signals on the newest `lookback` completed bars that were not handled before."""
+    found = []
+    for pos in range(max(0, len(enriched) - lookback), len(enriched)):
+        bar_time = enriched.index[pos]
+        if not (ENTRY_START <= bar_time.time() < ENTRY_END):
+            continue
+        bar_iso = bar_time.tz_convert("UTC").isoformat()
+        if bar_iso <= last_bar:
+            continue
+        row = enriched.iloc[pos]
+        if not data_ready(row):
+            continue
+        ctx = build_context(enriched.iloc[:pos + 1], market)
+        side, score, checks = analyze(row, ctx)
+        if side:
+            found.append({
+                "time": bar_time, "bar_iso": bar_iso, "row": row, "side": side,
+                "score": score, "checks": checks, "ctx": ctx,
+            })
+    return found
+
+
+def make_plan(side, entry, atr, levels):
+    return sr.plan_trade(
+        side, entry, atr, levels,
+        atr_mult=ATR_MULT, rr=RR, min_rr=MIN_RR, max_stop_atr=MAX_STOP_ATR,
+    )
 
 
 def position_size(equity, buying_power, price, stop_distance):
@@ -537,56 +698,131 @@ def close_position_end_of_day():
         print(f"Fin de día: no hay posición {SYMBOL} abierta.")
 
 
-def format_checks(checks):
-    return "\n".join(f"{'✅' if ok else '▫️'} {label}" for label, ok in checks)
+SEPARATOR = "━━━━━━━━━━━━━━━━━━"
 
 
-def format_signal(side, bar_time, row, score, checks, entry, stop, tp, qty, risk_dollars):
-    arrow = "🟢 COMPRA (LONG)" if side == "LONG" else "🔴 VENTA EN CORTO (SHORT)"
-    stop_dist = abs(entry - stop)
-    return (
-        f"📈 SEÑAL {SYMBOL} — {arrow}\n"
-        f"Vela 5m: {bar_time.strftime('%Y-%m-%d %H:%M')} NY\n"
-        f"Confluencia: {score}/8 (mínimo {MIN_SCORE})\n\n"
-        f"{format_checks(checks)}\n\n"
-        f"💵 Entrada aprox: ${entry:.2f}\n"
-        f"🛑 Stop loss: ${stop:.2f} (-${stop_dist:.2f}/acción)\n"
-        f"🎯 Take profit: ${tp:.2f} (R:R 1:{RR:g})\n"
-        f"📦 Cantidad: {qty} acciones (~${qty * entry:,.2f})\n"
-        f"⚖️ Riesgo máx: ~${qty * stop_dist:,.2f} (presupuesto ${risk_dollars:,.2f})\n"
-        f"RSI {row['rsi']:.1f} · ADX {row['adx']:.1f} · ATR {row['atr']:.2f}\n"
-        "Cuenta: Alpaca PAPER"
-    )
+def format_checks(mandatory, optional):
+    lines = ["Filtros obligatorios:"]
+    lines += [f"{'✅' if ok else '❌'} {label}" for label, ok in mandatory]
+    lines.append("Confirmaciones:")
+    lines += [f"{'✅' if ok else '▫️'} {label}" for label, ok in optional]
+    return "\n".join(lines)
 
 
-def run_diagnostics(now_ny):
+def format_news(news, now_utc):
+    if not news:
+        return [f"📰 Sin noticias de {SYMBOL} en las últimas {NEWS_HOURS} h."]
+    lines = [f"📰 Noticias ({NEWS_HOURS} h):"]
+    for item in news[:3]:
+        headline = item["headline"]
+        if len(headline) > 110:
+            headline = headline[:107] + "..."
+        lines.append(f"• {item['time'].tz_convert(NY):%d/%m %H:%M} {headline}")
+    if any(now_utc - item["time"] <= pd.Timedelta(minutes=NEWS_HOT_MINUTES) for item in news):
+        lines.append(f"⚠️ Hay noticias de los últimos {NEWS_HOT_MINUTES} min: puede haber volatilidad.")
+    if any(re.search(r"earnings|quarterly results|guidance", item["headline"], re.I) for item in news):
+        lines.append("⚠️ Se habla de resultados/earnings: cuidado con movimientos bruscos.")
+    return lines
+
+
+def format_market_view(ctx, row, price, news, now_utc):
+    levels = ctx["levels"]
+    above = sr.nearest(levels, price, "up")
+    below = sr.nearest(levels, price, "down")
+    lines = [
+        "🧱 Resistencias: " + (" · ".join(f"${l.price:.2f} {l.label}" for l in above) or "ninguna cercana"),
+        "🧱 Soportes: " + (" · ".join(f"${l.price:.2f} {l.label}" for l in below) or "ninguno cercano"),
+    ]
+    fibs = sr.fib_levels(row)
+    if fibs:
+        up = row["fib_dir"] == 1
+        start, end = (row["fib_lo"], row["fib_hi"]) if up else (row["fib_hi"], row["fib_lo"])
+        lines.append(
+            f"📐 Fibonacci tramo {'alcista' if up else 'bajista'} ${start:.2f} → ${end:.2f}: "
+            + " · ".join(f"{l.label[4:]} ${l.price:.2f}" for l in fibs)
+        )
+    market = ctx.get("market")
+    if market:
+        arrows = {1: "▲", -1: "▼", 0: "▬"}
+        lines.append("🌎 Mercado ahora: " + " · ".join(f"{s} {arrows[v]}" for s, v in market.items()))
+    else:
+        lines.append("🌎 Mercado ahora: sin datos")
+    lines += format_news(news, now_utc)
+    return lines
+
+
+def format_signal(candidate, plan, qty, equity, news, now_utc):
+    side = candidate["side"]
+    row = candidate["row"]
+    mandatory, optional = candidate["checks"]
+    entry, stop, target = plan["entry"], plan["stop"], plan["target"]
+    risk, reward = plan["risk"], abs(target - entry)
+    if side == "LONG":
+        header = f"🟢 LONG — COMPRA {SYMBOL}"
+    else:
+        header = f"🔴 SHORT — VENTA EN CORTO {SYMBOL}"
+    lines = [
+        header,
+        SEPARATOR,
+        f"💵 Entrada: ${entry:.2f} (a mercado)",
+        f"🛑 Stop loss: ${stop:.2f} (riesgo ${risk:.2f}/acción · {plan['stop_note']})",
+        f"🎯 Take profit: ${target:.2f} (ganancia ${reward:.2f}/acción · {plan['target_note']})",
+        f"⚖️ Riesgo/beneficio: 1:{plan['rr']:.1f}",
+        f"📦 Cantidad: {qty} acciones (~${qty * entry:,.2f})",
+        f"💸 Pérdida máx. si toca el stop: ${qty * risk:,.2f} ({100 * qty * risk / equity:.2f}% de la cuenta)",
+        SEPARATOR,
+        f"📊 Confluencia {candidate['score']}/{len(optional)} (mínimo {MIN_SCORE})",
+        format_checks(mandatory, optional),
+        f"RSI {row['rsi']:.1f} · ADX {row['adx']:.1f} · ATR {row['atr']:.2f}",
+        SEPARATOR,
+        *format_market_view(candidate["ctx"], row, entry, news, now_utc),
+        SEPARATOR,
+        f"⏰ Vela 5m {candidate['time']:%Y-%m-%d %H:%M} NY · Alpaca PAPER",
+    ]
+    return "\n".join(lines)
+
+
+def run_diagnostics(now_utc):
+    now_ny = now_utc.tz_convert(NY)
     account_equity, _ = get_account()
     clock = get_clock()
     lines = [
         "🧪 Diagnóstico PAPER solamente",
         f"Cuenta equity: ${account_equity:.2f}",
         f"Mercado abierto según Alpaca: {clock.get('is_open')}",
-        f"Hora Nueva York: {now_ny.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Hora Nueva York: {now_ny:%Y-%m-%d %H:%M:%S}",
+        f"Lados habilitados: {TRADE_SIDES}",
     ]
     frame = get_bars()
     if not frame.empty:
         frame = frame.between_time("09:30", "15:59")
+        frame = frame[frame.index + pd.Timedelta(minutes=5) <= now_utc]
     if len(frame) >= 100:
         enriched = add_indicators(frame)
         row = enriched.iloc[-1]
-        lines.append(f"\nÚltima vela {SYMBOL}: {enriched.index[-1].strftime('%Y-%m-%d %H:%M')} cierre ${row['close']:.2f}")
-        side, score, _ = analyze(row)
+        market = get_market_context(now_utc)
+        news = get_news(now_utc)
+        ctx = build_context(enriched, market)
+        lines.append(f"\nÚltima vela {SYMBOL}: {enriched.index[-1]:%Y-%m-%d %H:%M} cierre ${row['close']:.2f}")
+        side, score, (mandatory, optional) = analyze(row, ctx)
         if side:
-            lines.append(f"Señal actual: {side} ({score}/8)")
+            plan = make_plan(side, float(row["close"]), float(row["atr"]), ctx["levels"])
+            lines.append(f"Señal actual: {side} ({score}/{len(optional)})")
+            lines.append(
+                f"Stop ${plan['stop']:.2f} · Target ${plan['target']:.2f} · R:R 1:{plan['rr']:.1f}"
+                + ("" if plan["ok"] else f"\n⛔ Se descartaría: {plan['reason']}")
+            )
+            lines.append(format_checks(mandatory, optional))
         elif data_ready(row):
             # Show the checklist for the side the EMAs lean towards, for transparency.
             lean = "LONG" if row["ema_fast"] > row["ema_slow"] else "SHORT"
-            mandatory, optional, _ = side_checks(row, lean)
+            mandatory, optional, _ = side_checks(row, lean, ctx)
             lines.append(
                 f"Sin señal. Chequeo {lean} "
-                f"({sum(ok for _, ok in optional)}/8, mínimo {MIN_SCORE}):"
+                f"({sum(ok for _, ok in optional)}/{len(optional)}, mínimo {MIN_SCORE}):"
             )
-            lines.append(format_checks(mandatory + optional))
+            lines.append(format_checks(mandatory, optional))
+        lines += [SEPARATOR] + format_market_view(ctx, row, float(row["close"]), news, now_utc)
     else:
         lines.append("Datos insuficientes para analizar.")
     lines.append("\nLa ejecución manual no envía órdenes.")
@@ -606,7 +842,7 @@ def main():
 
     # Manual workflow runs are diagnostics only; they never place orders.
     if MANUAL:
-        run_diagnostics(now_ny)
+        run_diagnostics(now_utc)
         save_state(state)
         return
 
@@ -648,33 +884,25 @@ def main():
         return
 
     enriched = add_indicators(completed)
-    candidates = []
-    for bar_time, row in enriched.iloc[-3:].iterrows():
-        if bar_time.time() < ENTRY_START or bar_time.time() >= ENTRY_END:
-            continue
-        bar_iso = bar_time.tz_convert("UTC").isoformat()
-        if bar_iso <= state.get("last_bar", ""):
-            continue
-        side, score, checks = analyze(row)
-        if side:
-            candidates.append((bar_time, row, side, score, checks, bar_iso))
-
+    market = get_market_context(now_utc)
+    candidates = scan(enriched, market, state.get("last_bar", ""))
     if not candidates:
         last = enriched.iloc[-1]
-        print(f"Sin señal. Cierre {last['close']:.2f}, RSI {last['rsi']:.1f}, ADX {last['adx']:.1f}.")
+        print(f"Sin señal. Cierre {last['close']:.2f}, RSI {last['rsi']:.1f}, ADX {last['adx']:.1f}, mercado {market}.")
         save_state(state)
         return
 
-    bar_time, row, side, score, checks, bar_iso = candidates[-1]
+    candidate = candidates[-1]
+    side, row = candidate["side"], candidate["row"]
     # From here on this bar is consumed, whatever happens next.
-    state["last_bar"] = bar_iso
+    state["last_bar"] = candidate["bar_iso"]
 
     signal_price = float(row["close"])
     atr = float(row["atr"])
-    stop_distance = atr * ATR_MULT
     latest_price = float(enriched["close"].iloc[-1])
+    max_drift = MAX_DRIFT_ATR * ATR_MULT * atr
 
-    if abs(latest_price - signal_price) > MAX_DRIFT_ATR * stop_distance:
+    if abs(latest_price - signal_price) > max_drift:
         telegram(
             "⏰ Señal descartada por movimiento tardío\n"
             f"{SYMBOL} {side}; señal {signal_price:.2f}, último cierre {latest_price:.2f}.\n"
@@ -694,21 +922,32 @@ def main():
         save_state(state)
         return
 
+    if side == "SHORT":
+        allowed, reason = can_short()
+        if not allowed:
+            telegram(f"⚠️ Señal SHORT de {SYMBOL} omitida: {reason}")
+            save_state(state)
+            return
+
+    plan = make_plan(side, latest_price, atr, candidate["ctx"]["levels"])
+    if not plan["ok"]:
+        print(f"Señal {side} descartada: {plan['reason']}")
+        save_state(state)
+        return
+
     equity, buying_power = get_account()
-    qty, risk_dollars = position_size(equity, buying_power, latest_price, stop_distance)
+    qty, risk_dollars = position_size(equity, buying_power, latest_price, plan["risk"])
     if qty < 1:
         telegram(
             f"⚠️ Señal {SYMBOL} omitida: el tamaño calculado es menor a 1 acción.\n"
             f"Equity ${equity:.2f}; riesgo objetivo ${risk_dollars:.2f}; "
-            f"distancia stop ${stop_distance:.2f}."
+            f"distancia stop ${plan['risk']:.2f}."
         )
         save_state(state)
         return
 
-    stop_price, tp_price = compute_levels(side, latest_price, stop_distance)
-    signal_text = format_signal(
-        side, bar_time, row, score, checks, latest_price, stop_price, tp_price, qty, risk_dollars
-    )
+    news = get_news(now_utc)
+    signal_text = format_signal(candidate, plan, qty, equity, news, now_utc)
     # Persist before the (long) approval wait so a crash cannot re-ask for the same bar.
     save_state(state)
 
@@ -717,7 +956,7 @@ def main():
         print(f"Decisión: {decision}. No se opera.")
         return
 
-    # Re-validate everything after the human delay: price, market, existing exposure.
+    # Re-validate everything after the human delay: market, exposure, live price.
     if not get_clock().get("is_open", False):
         telegram("⚠️ El mercado cerró mientras esperaba la aprobación. No se envió la orden.")
         return
@@ -726,25 +965,34 @@ def main():
         telegram(f"⚠️ {reason} No se envió la orden.")
         return
     entry_now = get_latest_price()
-    if abs(entry_now - signal_price) > MAX_DRIFT_ATR * stop_distance:
+    if abs(entry_now - signal_price) > max_drift:
         telegram(
             f"⚠️ El precio se movió demasiado durante la aprobación ({signal_price:.2f} → {entry_now:.2f}).\n"
             "Orden cancelada por seguridad."
         )
         return
 
-    # Rebuild the bracket around the current price so Alpaca accepts the legs and
-    # the planned risk per share stays identical.
+    # Stop and target stay at the planned prices (they are tied to levels);
+    # check they still make sense from the live price and resize to the real risk.
+    stop, target = plan["stop"], plan["target"]
+    sign = 1 if side == "LONG" else -1
+    risk_now = sign * (entry_now - stop)
+    reward_now = sign * (target - entry_now)
+    if risk_now < 0.02 or reward_now < 0.02 or reward_now / risk_now < MIN_RR_AFTER_APPROVAL:
+        telegram(
+            f"⚠️ Con el precio actual (${entry_now:.2f}) el stop ${stop:.2f} y el target "
+            f"${target:.2f} ya no dan un riesgo/beneficio aceptable. Orden cancelada."
+        )
+        return
     equity, buying_power = get_account()
-    qty, _ = position_size(equity, buying_power, entry_now, stop_distance)
+    qty, _ = position_size(equity, buying_power, entry_now, risk_now)
     if qty < 1:
         telegram("⚠️ Tamaño de posición menor a 1 acción tras la aprobación. No se operó.")
         return
-    stop_price, tp_price = compute_levels(side, entry_now, stop_distance)
 
-    client_order_id = f"bot-{SYMBOL}-{bar_time.strftime('%Y%m%d%H%M')}-{secrets.token_hex(3)}"
+    client_order_id = f"bot-{SYMBOL}-{candidate['time']:%Y%m%d%H%M}-{secrets.token_hex(3)}"
     try:
-        order = send_order(side, qty, stop_price, tp_price, client_order_id)
+        order = send_order(side, qty, stop, target, client_order_id)
     except requests.HTTPError as exc:
         body = exc.response.text[:300] if exc.response is not None else str(exc)
         telegram(f"❌ Alpaca rechazó la orden: {body}")
@@ -756,12 +1004,12 @@ def main():
     order = wait_for_fill(order["id"])
     fill = order.get("filled_avg_price")
     telegram(
-        f"🚀 Orden enviada a Alpaca PAPER — {SYMBOL} {side}\n"
+        f"🚀 Orden enviada a Alpaca PAPER — {'🟢 LONG' if side == 'LONG' else '🔴 SHORT'} {SYMBOL}\n"
         f"Estado: {order.get('status')}\n"
         f"Cantidad: {qty}\n"
         f"Precio de ejecución: {('$' + format(float(fill), '.2f')) if fill else 'pendiente'}\n"
-        f"🛑 Stop loss: ${stop_price:.2f}\n"
-        f"🎯 Take profit: ${tp_price:.2f}\n"
+        f"🛑 Stop loss: ${stop:.2f}\n"
+        f"🎯 Take profit: ${target:.2f}\n"
         f"Operaciones hoy: {state['count']}/{MAX_TRADES_DAY}\n"
         f"ID: {client_order_id}"
     )
