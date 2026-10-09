@@ -1,9 +1,9 @@
 
 name: nvda-bot-paper
 
+# El cron está apagado: la estrategia de NVDA perdió plata en la investigación (research/) y
+# la reemplaza el bot ORB5 (orb.yml). Queda la ejecución manual para diagnósticos.
 on:
-  schedule:
-    - cron: "*/5 12-21 * * 1-5"
   workflow_dispatch:
 
 permissions:
