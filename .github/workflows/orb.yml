@@ -47,7 +47,7 @@ jobs:
       - name: Instalar dependencias
         run: pip install pandas requests
 
-      - name: Ejecutar bot ORB5 (PAPER)
+      - name: Ejecutar bot ORB (PAPER)
         env:
           ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
           ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
