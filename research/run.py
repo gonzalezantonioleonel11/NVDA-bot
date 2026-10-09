@@ -1,11 +1,11 @@
 """
 Investigación de estrategias intradía en acciones y ETFs de Alpaca, con validación walk-forward.
 
-Para cada familia de estrategias y cada año de prueba, se eligen los parámetros mirando solo
-los 3 años anteriores y se mide el año siguiente, que la elección no vio. El resultado
-"fuera de muestra" es la unión de esos años de prueba.
+Usa los últimos 2 años. Para cada familia y cada trimestre de prueba, se eligen los parámetros
+mirando solo los 6 meses anteriores y se mide el trimestre siguiente, que la elección no vio.
+El resultado "fuera de muestra" es la unión de esos trimestres.
 
-Uso:  python -m research.run --start 2017-01-01 [--families ORB5,Ruido] [--symbols SPY,QQQ]
+Uso:  python -m research.run [--years 2] [--families ORB5,Ruido] [--symbols SPY,QQQ]
 """
 import argparse
 import os
@@ -25,22 +25,38 @@ RISKS = (0.005, 0.01, 0.02)
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
 
 
-def walk_forward(variants, test_years, train_years=3, min_train=150):
+def month_index(tr):
+    days = pd.to_datetime(pd.Series(tr["day"]))
+    return (days.dt.year * 12 + days.dt.month - 1).to_numpy()
+
+
+def label(mi):
+    return f"{mi // 12}-{mi % 12 + 1:02d}"
+
+
+def walk_forward(variants, windows, min_train=40):
+    """windows: (train_start, test_start, test_end) month indices. Picks by t-stat on the train months."""
+    months = {name: month_index(tr) if len(tr) else np.array([]) for name, tr in variants.items()}
     picks, oos = [], []
-    for year in test_years:
+    for train_start, test_start, test_end in windows:
         best = None
         for name, tr in variants.items():
             if len(tr) == 0:
                 continue
-            st = engine.trade_stats(tr[(tr["year"] >= year - train_years) & (tr["year"] < year)])
+            mi = months[name]
+            st = engine.trade_stats(tr[(mi >= train_start) & (mi < test_start)])
             if st["n"] < min_train or st["R"] <= 0:
                 continue
             if best is None or st["t"] > best[1]["t"]:
                 best = (name, st)
-        picks.append((year, best[0] if best else None))
+        window = f"{label(test_start)} a {label(test_end - 1)}"
         if best:
-            tr = variants[best[0]]
-            oos.append(tr[tr["year"] == year])
+            tr, mi = variants[best[0]], months[best[0]]
+            part = tr[(mi >= test_start) & (mi < test_end)]
+            oos.append(part)
+            picks.append((window, best[0], len(part), float(part["r"].sum()) if len(part) else 0.0))
+        else:
+            picks.append((window, None, 0, 0.0))
     return picks, (pd.concat(oos, ignore_index=True) if oos else pd.DataFrame())
 
 
@@ -53,12 +69,13 @@ def daily_t(trades, start, end, risk=0.01):
     return float(d.mean() / d.std(ddof=1) * np.sqrt(len(d))) if d.std(ddof=1) > 0 else 0.0
 
 
-def checks(st, st_stress, weeks, t_daily):
+def checks(st, st_stress, weeks, t_daily, picks):
     per_week = st["n"] / weeks if weeks else 0
+    pos_windows = sum(1 for p in picks if p[3] > 0) / len(picks) * 100 if picks else 0
     return {
         "PF fuera de muestra >= 1.15": st["pf"] >= 1.15,
         ">= 4 operaciones por semana": per_week >= 4,
-        "gana en >= 60% de los años": st["yrs_pos"] >= 60,
+        f"gana en >= 60% de los trimestres ({pos_windows:.0f}%)": pos_windows >= 60,
         "sigue ganando con costos x2": st_stress["R"] > 0,
         f"significativo (t diario {t_daily:.2f} >= 2)": t_daily >= 2,
     }, per_week
@@ -71,30 +88,39 @@ def fmt_stats(st):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--start", default="2017-01-01")
+    ap.add_argument("--years", type=float, default=2.0, help="años de datos (por defecto 2)")
     ap.add_argument("--symbols", default=DEFAULT_SYMBOLS)
     ap.add_argument("--families", default=",".join(families.FAMILIES))
     ap.add_argument("--feed", default="sip", choices=["sip", "iex"])
-    ap.add_argument("--train-years", type=int, default=3)
+    ap.add_argument("--train-months", type=int, default=6)
+    ap.add_argument("--test-months", type=int, default=3)
     args = ap.parse_args()
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    end = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    bars = data.load(symbols, f"{args.start}T00:00:00Z", end, args.feed)
+    now = pd.Timestamp.now(tz="UTC")
+    end = (now - pd.Timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    start = (now - pd.DateOffset(months=round(args.years * 12))).strftime("%Y-%m-01")
+    bars = data.load(symbols, f"{start}T00:00:00Z", end, args.feed)
     markets = {s: engine.Market(s, df) for s, df in bars.items() if len(df) > 1000}
-    first_year = min(int(m.year[0]) for m in markets.values())
-    last_year = max(int(m.year[-1]) for m in markets.values())
-    test_years = list(range(first_year + args.train_years, last_year + 1))
-    test_start = pd.Timestamp(f"{test_years[0]}-01-01")
-    test_end = max(pd.Timestamp(m.days[-1]) for m in markets.values())
+    first = min(pd.Timestamp(m.days[0]) for m in markets.values())
+    last = max(pd.Timestamp(m.days[-1]) for m in markets.values())
+    first_mi, last_mi = first.year * 12 + first.month - 1, last.year * 12 + last.month - 1
+    windows = []
+    test_mi = first_mi + args.train_months
+    while test_mi <= last_mi:
+        windows.append((test_mi - args.train_months, test_mi, min(test_mi + args.test_months, last_mi + 1)))
+        test_mi += args.test_months
+    test_start = pd.Timestamp(year=windows[0][1] // 12, month=windows[0][1] % 12 + 1, day=1)
+    test_end = last
     weeks = (test_end - test_start).days / 7
     os.makedirs(OUT_DIR, exist_ok=True)
 
     lines = [
         f"# Investigación intradía: {', '.join(markets)}",
         "",
-        f"Datos `{args.feed}` desde {args.start}: señales con velas de 5 minutos, ejecución simulada minuto a minuto. Años fuera de muestra: "
-        f"{test_years[0]}–{test_years[-1]} (cada año elegido solo con los {args.train_years} anteriores).",
+        f"Datos `{args.feed}` desde {first:%Y-%m-%d} hasta {last:%Y-%m-%d}: señales con velas de 5 minutos, "
+        f"ejecución simulada minuto a minuto. Fuera de muestra desde {test_start:%Y-%m}: cada trimestre usa "
+        f"los parámetros elegidos con los {args.train_months} meses anteriores.",
         f"Costos base: entrada {BASE.entry_bps} pb, stop {BASE.stop_bps} pb, salida {BASE.exit_bps} pb; "
         "estrés: el doble.",
         "",
@@ -108,12 +134,16 @@ def main():
         for name, tr in base.items():
             st = engine.trade_stats(tr)
             all_variants.append({"familia": fam, "variante": name, **{k: st[k] for k in ("n", "wr", "pf", "exp", "R", "t", "yrs_pos")}})
-        picks, oos = walk_forward(base, test_years, args.train_years)
-        oos_stress = pd.concat([stress[n][stress[n]["year"] == y] for y, n in picks if n], ignore_index=True) \
-            if any(n for _, n in picks) else pd.DataFrame()
+        picks, oos = walk_forward(base, windows)
+        stress_parts = []
+        for (train_start, test_start_mi, test_end_mi), (_, name, _, _) in zip(windows, picks):
+            if name and len(stress[name]):
+                mi = month_index(stress[name])
+                stress_parts.append(stress[name][(mi >= test_start_mi) & (mi < test_end_mi)])
+        oos_stress = pd.concat(stress_parts, ignore_index=True) if stress_parts else pd.DataFrame()
         st, st_s = engine.trade_stats(oos), engine.trade_stats(oos_stress)
         t_d = daily_t(oos, test_start, test_end) if len(oos) else 0.0
-        ok, per_week = checks(st, st_s, weeks, t_d)
+        ok, per_week = checks(st, st_s, weeks, t_d, picks)
         passed = all(ok.values())
         summary_rows.append((fam, st, st_s, per_week, passed))
         if len(oos):
@@ -126,10 +156,9 @@ def main():
                   f"- Fuera de muestra: {fmt_stats(st)}; {per_week:.1f} ops/semana",
                   f"- Con costos x2: {fmt_stats(st_s)}"]
         lines += [f"- {k}: {'sí' if v else 'NO'}" for k, v in ok.items()]
-        lines += ["", "| Año | Variante elegida (con años anteriores) | Ops | R del año |", "|---|---|---|---|"]
-        for year, name in picks:
-            yr = oos[oos["year"] == year] if len(oos) else oos
-            lines.append(f"| {year} | {name or 'ninguna calificó'} | {len(yr)} | {yr['r'].sum() if len(yr) else 0:+.1f} |")
+        lines += ["", "| Trimestre | Variante elegida (con los meses anteriores) | Ops | R |", "|---|---|---|---|"]
+        for window, name, n, r in picks:
+            lines.append(f"| {window} | {name or 'ninguna calificó'} | {n} | {r:+.1f} |")
         if len(oos):
             lines += ["", "| Riesgo por op. | Mes promedio | Mes mediano | Meses >= 3% | Meses negativos | Peor mes | Anual (CAGR) | Máx. caída |",
                       "|---|---|---|---|---|---|---|---|"]
@@ -142,9 +171,8 @@ def main():
                 final.append(f"   riesgo {risk * 100:.1f}%: mes prom {ms['mean_m']:+.2f}% mediano {ms['median_m']:+.2f}% "
                              f">=3% {ms['pct_ge3']:.0f}% neg {ms['pct_neg']:.0f}% peor {ms['worst_m']:+.1f}% "
                              f"CAGR {ms['cagr']:+.1f}% maxDD {ms['max_dd']:.1f}%")
-            for year, name in picks:
-                yr = oos[oos["year"] == year]
-                final.append(f"   {year}: {name or '-'} -> {len(yr)} ops, R {yr['r'].sum() if len(yr) else 0:+.1f}")
+            for window, name, n, r in picks:
+                final.append(f"   {window}: {name or '-'} -> {n} ops, R {r:+.1f}")
         lines.append("")
 
     pd.DataFrame(all_variants).to_csv(os.path.join(OUT_DIR, "variantes.csv"), index=False)
