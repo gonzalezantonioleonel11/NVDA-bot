@@ -561,6 +561,11 @@ def main():
         save_state(state)
         return
 
+
     if side == "LONG":
         stop_price = round(signal_price - stop_distance, 2)
-        tp_price = round(sig
+        tp_price = round(signal_price + stop_distance * RR, 2)
+    else:
+        stop_price = round(signal_price + stop_distance, 2)
+        tp_price = round(signal_price - stop_distance * RR, 2)
+        
