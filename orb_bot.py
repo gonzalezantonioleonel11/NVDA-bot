@@ -26,6 +26,7 @@ import pandas as pd
 import requests
 
 import bot
+import sectors
 
 NY = bot.NY
 DATA_URL = bot.DATA_URL
@@ -47,6 +48,7 @@ BOTH_SIDES = True         # True: ruptura hacia cualquier lado; False: solo en l
 CONFIRM_BARS = 1          # velas de 1 minuto seguidas que tienen que cerrar fuera del rango antes de entrar
                           # (2 se probó en research/: mismos aciertos, algo menos de ganancia promedio)
 TOP_N = 3                 # acciones por día (las de mayor volumen relativo)
+MAX_PER_SECTOR = 1        # máximo de acciones del mismo sector por día (sectors.py); None = sin límite
 RVOL_MIN = 0.0            # mínimo de volumen del rango vs. su promedio de 14 sesiones (0 = siempre las TOP_N)
 STOP_MODE = "opp"         # "opp": otro extremo del rango; "mid": mitad del rango; "atr10": 10% del ATR diario
 TP_R = None               # take profit en múltiplos del riesgo (None = sin TP, sale al cierre)
@@ -151,13 +153,28 @@ def opening_ranges(symbols, session_open, hist):
             continue
         cands.append({"sym": sym, "side": None if BOTH_SIDES else (1 if c > o else -1), "open": o, "close": c,
                       "high": float(df["h"].max()), "low": float(df["l"].min()), "rvol": rvol, "atr14": h["atr14"]})
-    cands.sort(key=lambda x: -x["rvol"])
-    return cands[:TOP_N]
+    return choose(cands)
+
+
+def choose(cands):
+    """The TOP_N candidates with the highest relative volume, at most MAX_PER_SECTOR per sector:
+    stocks of the same sector tend to break out (and fail) together on the same news."""
+    chosen, used = [], {}
+    for c in sorted(cands, key=lambda x: -x["rvol"]):
+        group = sectors.sector(c["sym"])
+        if MAX_PER_SECTOR is not None and used.get(group, 0) >= MAX_PER_SECTOR:
+            continue
+        chosen.append(c)
+        used[group] = used.get(group, 0) + 1
+        if len(chosen) == TOP_N:
+            break
+    return chosen
 
 
 def describe(c):
     direction = "cualquier lado" if c["side"] is None else ("alcista" if c["side"] == 1 else "bajista")
-    return f"• {c['sym']} ({direction}) | rango {c['low']:.2f}-{c['high']:.2f} | volumen x{c['rvol']:.1f}"
+    return (f"• {c['sym']} ({sectors.sector(c['sym'])}, {direction}) | rango {c['low']:.2f}-{c['high']:.2f} "
+            f"| volumen x{c['rvol']:.1f}")
 
 
 # ------------------------------------------------------------------ órdenes
@@ -400,7 +417,8 @@ def run_diagnostic():
     now = pd.Timestamp.now(tz=NY)
     account = bot.api("GET", "/v2/account")
     lines = [f"🧪 Diagnóstico {NAME} (PAPER, no opera)", f"Equity: ${float(account['equity']):,.2f}",
-             f"Universo: {len(UNIVERSE)} símbolos | top {TOP_N} por volumen relativo"
+             f"Universo: {len(UNIVERSE)} símbolos | top {TOP_N} por volumen relativo, "
+             f"{f'máx. {MAX_PER_SECTOR} por sector' if MAX_PER_SECTOR else 'sin límite por sector'}"
              + (f" (mínimo x{RVOL_MIN})" if RVOL_MIN else ""),
              f"Stop: {STOP_MODE} | TP: {f'{TP_R}R' if TP_R else 'ninguno, sale al cierre'} | riesgo {RISK_PCT}% "
              f"por operación | entradas hasta "
