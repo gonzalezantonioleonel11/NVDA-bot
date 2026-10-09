@@ -11,6 +11,7 @@ Modos (los elige el workflow orb.yml):
   python orb_bot.py session     ~9:00-12:00 NY: selección y entradas (en media jornada también cierra)
   python orb_bot.py close       ~15:30-15:55 NY: cierra todo a las 15:50 y manda el resumen
   python orb_bot.py diagnostic  muestra la selección de la última sesión y la cuenta, sin operar
+  python orb_bot.py status      posiciones abiertas, resultado del día y operaciones cerradas, sin operar
 """
 import csv
 import math
@@ -383,11 +384,43 @@ def run_diagnostic():
     bot.telegram("\n".join(lines))
 
 
+def run_status():
+    """Open positions with their unrealized result, today's closed trades and the day's result."""
+    now = pd.Timestamp.now(tz=NY)
+    account = bot.api("GET", "/v2/account")
+    equity, last_equity = float(account["equity"]), float(account.get("last_equity") or account["equity"])
+    positions = bot.api("GET", "/v2/positions") or []
+    lines = [f"📈 Estado {NAME} (PAPER) {now:%Y-%m-%d %H:%M} NY",
+             f"Equity: ${equity:,.2f} | Día: {bot.money(equity - last_equity)} ({(equity / last_equity - 1) * 100:+.2f}%)"]
+    open_symbols = set()
+    if positions:
+        lines.append("Abiertas:")
+        for p in positions:
+            qty = float(p["qty"])
+            open_symbols.add(p["symbol"])
+            lines.append(f"• {p['symbol']} {'largo' if qty > 0 else 'corto'} x{abs(qty):g}: entrada "
+                         f"{float(p['avg_entry_price']):.2f}, ahora {float(p['current_price']):.2f} -> "
+                         f"{bot.money(float(p['unrealized_pl']))} ({float(p['unrealized_plpc']) * 100:+.2f}%)")
+    else:
+        lines.append("Sin posiciones abiertas.")
+    fills = bot.api("GET", "/v2/account/activities/FILL", params={"date": now.strftime("%Y-%m-%d")}) or []
+    closed = {}
+    for f in fills:
+        if f.get("symbol") not in open_symbols:
+            sign = -1 if f["side"] == "buy" else 1
+            closed[f["symbol"]] = closed.get(f["symbol"], 0.0) + sign * float(f["qty"]) * float(f["price"])
+    if closed:
+        lines.append("Cerradas hoy:")
+        lines += [f"• {sym}: {bot.money(value)}" for sym, value in sorted(closed.items())]
+    print("\n".join(lines))
+    bot.telegram("\n".join(lines))
+
+
 def main():
     if not bot.KEY or not bot.SECRET:
         raise RuntimeError("Faltan ALPACA_KEY o ALPACA_SECRET en los secrets de GitHub.")
     mode = sys.argv[1] if len(sys.argv) > 1 else "diagnostic"
-    {"session": run_session, "close": run_close, "diagnostic": run_diagnostic}[mode]()
+    {"session": run_session, "close": run_close, "diagnostic": run_diagnostic, "status": run_status}[mode]()
 
 
 if __name__ == "__main__":

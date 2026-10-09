@@ -17,13 +17,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "diagnostic: muestra la selección sin operar"
+        description: "status: posiciones y resultado de hoy | diagnostic: selección de la última sesión (ninguno opera)"
         type: choice
         options:
+          - status
           - diagnostic
           - session
           - close
-        default: diagnostic
+        default: status
 
 permissions:
   contents: write
