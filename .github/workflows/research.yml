@@ -3,9 +3,9 @@ name: research
 on:
   workflow_dispatch:
     inputs:
-      start:
-        description: "Fecha de inicio de los datos (AAAA-MM-DD)"
-        default: "2017-01-01"
+      years:
+        description: "Años de datos (por defecto 2)"
+        default: "2"
         required: true
       symbols:
         description: "Símbolos separados por coma (vacío = lista por defecto)"
@@ -47,20 +47,20 @@ jobs:
         uses: actions/cache@v4
         with:
           path: research/cache
-          key: research-bars-v1-${{ inputs.feed }}-${{ inputs.start }}-${{ steps.week.outputs.week }}
+          key: research-bars-v2-${{ inputs.feed }}-${{ inputs.years }}-${{ steps.week.outputs.week }}
           restore-keys: |
-            research-bars-v1-${{ inputs.feed }}-${{ inputs.start }}-
+            research-bars-v2-${{ inputs.feed }}-${{ inputs.years }}-
 
       - name: Ejecutar investigación
         env:
           ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
           ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
-          START: ${{ inputs.start }}
+          YEARS: ${{ inputs.years }}
           SYMBOLS: ${{ inputs.symbols }}
           FAMILIES: ${{ inputs.families }}
           FEED: ${{ inputs.feed }}
         run: |
-          args=(--start "$START" --feed "$FEED")
+          args=(--years "$YEARS" --feed "$FEED")
           if [ -n "$SYMBOLS" ]; then args+=(--symbols "$SYMBOLS"); fi
           if [ -n "$FAMILIES" ]; then args+=(--families "$FAMILIES"); fi
           python -m research.run "${args[@]}"
