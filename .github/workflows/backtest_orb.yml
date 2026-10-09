@@ -1,0 +1,40 @@
+name: nvda-backtest-orb
+
+on:
+  workflow_dispatch:   # se lanza a mano: Actions -> nvda-backtest-orb -> Run workflow
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install alpaca-py pandas numpy requests
+
+      - name: Ejecutar backtest ORB
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python backtest_orb.py
+
+      - name: Guardar resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultados_orb
+          path: |
+            reporte.md
+            trades.csv
+          if-no-files-found: ignore
