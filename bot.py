@@ -219,43 +219,45 @@ def add_indicators(frame):
     return df
 
 
-def evaluate(row):
+def signal_conditions(row):
+    """Each named filter of the strategy for LONG and SHORT; a signal needs all of them."""
+    common = {
+        "datos completos": (
+            pd.notna(row["atr"]) and row["atr"] > 0
+            and pd.notna(row["vwap"]) and pd.notna(row["rsi"]) and pd.notna(row["rsi_prev"])
+        ),
+        f"ADX > {ADX_MIN}": pd.notna(row["adx"]) and row["adx"] > ADX_MIN,
+        "volumen alto": bool(row["vol_ok"]),
+    }
     # Original indicator filters are retained; structure plus FVG/sweep add confluence.
-    base = (
-        pd.notna(row["adx"])
-        and row["adx"] > ADX_MIN
-        and bool(row["vol_ok"])
-        and pd.notna(row["atr"])
-        and row["atr"] > 0
-        and pd.notna(row["vwap"])
-        and pd.notna(row["rsi"])
-        and pd.notna(row["rsi_prev"])
-    )
+    long_conditions = {
+        **common,
+        "EMA20 > EMA50": row["ema_fast"] > row["ema_slow"],
+        "precio > VWAP": row["close"] > row["vwap"],
+        "RSI cruza 45 hacia arriba": row["rsi_prev"] <= 45 < row["rsi"],
+        "MACD > 0": row["macd_hist"] > 0,
+        "ruptura alcista reciente": bool(row["structure_up_recent"]),
+        "FVG o barrido alcista": bool(row["fvg_bull_recent"]) or bool(row["sweep_bull_recent"]),
+        "sesgo alcista": row["market_bias"] == 1,
+    }
+    short_conditions = {
+        **common,
+        "EMA20 < EMA50": row["ema_fast"] < row["ema_slow"],
+        "precio < VWAP": row["close"] < row["vwap"],
+        "RSI cruza 55 hacia abajo": row["rsi_prev"] >= 55 > row["rsi"],
+        "MACD < 0": row["macd_hist"] < 0,
+        "ruptura bajista reciente": bool(row["structure_down_recent"]),
+        "FVG o barrido bajista": bool(row["fvg_bear_recent"]) or bool(row["sweep_bear_recent"]),
+        "sesgo bajista": row["market_bias"] == -1,
+    }
+    return {"LONG": long_conditions, "SHORT": short_conditions}
 
-    long_signal = (
-        base
-        and row["ema_fast"] > row["ema_slow"]
-        and row["close"] > row["vwap"]
-        and row["rsi_prev"] <= 45 < row["rsi"]
-        and row["macd_hist"] > 0
-        and bool(row["structure_up_recent"])
-        and (bool(row["fvg_bull_recent"]) or bool(row["sweep_bull_recent"]))
-        and row["market_bias"] == 1
-    )
-    short_signal = (
-        base
-        and row["ema_fast"] < row["ema_slow"]
-        and row["close"] < row["vwap"]
-        and row["rsi_prev"] >= 55 > row["rsi"]
-        and row["macd_hist"] < 0
-        and bool(row["structure_down_recent"])
-        and (bool(row["fvg_bear_recent"]) or bool(row["sweep_bear_recent"]))
-        and row["market_bias"] == -1
-    )
-    if long_signal:
-        return "LONG"
-    if short_signal:
-        return "SHORT"
+
+def evaluate(row):
+    conditions = signal_conditions(row)
+    for side in ("LONG", "SHORT"):
+        if all(conditions[side].values()):
+            return side
     return None
 
 

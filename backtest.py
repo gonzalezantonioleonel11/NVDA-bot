@@ -117,6 +117,8 @@ def simulate(frame, session_closes, start_equity, slippage):
     skipped = {"ya en posición": 0, "límite diario": 0, "menos de 1 acción": 0}
     trades_per_day = {}
     busy_until = -1
+    # Per side: bars passing each filter, and signals there would be without that one filter.
+    funnel = {side: {"barras": 0, "pasa": {}, "sin_este": {}} for side in ("LONG", "SHORT")}
 
     for i in range(WARMUP_BARS, len(df) - 1):
         bar_time = times[i]
@@ -130,6 +132,16 @@ def simulate(frame, session_closes, start_equity, slippage):
             continue
 
         row = df.iloc[i]
+        for funnel_side, conditions in bot.signal_conditions(row).items():
+            stats = funnel[funnel_side]
+            stats["barras"] += 1
+            failed = [name for name, ok in conditions.items() if not ok]
+            for name in conditions:
+                stats["pasa"][name] = stats["pasa"].get(name, 0) + (name not in failed)
+                stats["sin_este"].setdefault(name, 0)
+            if len(failed) == 1:
+                stats["sin_este"][failed[0]] += 1
+
         side = bot.evaluate(row)
         if not side:
             continue
@@ -180,7 +192,32 @@ def simulate(frame, session_closes, start_equity, slippage):
             "r": round(pnl / (qty * stop_distance), 2),
             "equity": round(equity, 2),
         })
-    return trades, skipped
+    return trades, skipped, funnel
+
+
+def top_blocker(funnel):
+    """The filter whose removal alone would unlock the most signals."""
+    best = None
+    for side, stats in funnel.items():
+        for name, count in stats["sin_este"].items():
+            if best is None or count > best[2]:
+                best = (side, name, count)
+    return best
+
+
+def funnel_markdown(funnel):
+    lines = [
+        "## Qué filtros bloquean las señales",
+        "",
+        "\"Pasa\": % de velas del horario de entradas que cumplen ese filtro. "
+        "\"Señales sin este filtro\": cuántas señales habría si se quitara solo ese filtro.",
+    ]
+    for side, stats in funnel.items():
+        total = stats["barras"] or 1
+        lines += ["", f"### {side}", "", "| Filtro | Pasa | Señales sin este filtro |", "|---|---|---|"]
+        for name, passed in stats["pasa"].items():
+            lines.append(f"| {name} | {passed / total * 100:.1f}% | {stats['sin_este'][name]} |")
+    return lines
 
 
 def metrics(trades, start_equity, frame):
@@ -247,7 +284,7 @@ def verdict(m):
     return "❌ La estrategia perdió plata en este período."
 
 
-def report_markdown(m, period, args, skipped):
+def report_markdown(m, period, args, skipped, funnel):
     lines = [
         f"# Backtest NVDA: {period}",
         "",
@@ -255,7 +292,7 @@ def report_markdown(m, period, args, skipped):
         "",
     ]
     if not m["trades"]:
-        lines.append("No hubo ninguna operación en el período.")
+        lines += ["No hubo ninguna operación en el período.", ""] + funnel_markdown(funnel)
         return "\n".join(lines)
     lines += [
         f"**{verdict(m)}**",
@@ -291,14 +328,27 @@ def report_markdown(m, period, args, skipped):
         "",
         "Señales no tomadas: " + ", ".join(f"{k}: {v}" for k, v in skipped.items()) + ".",
         "",
+    ]
+    lines += funnel_markdown(funnel)
+    lines += [
+        "",
         "El detalle de cada operación está en el archivo `backtest_trades.csv` (artifact de esta ejecución).",
     ]
     return "\n".join(lines)
 
 
-def report_telegram(m, period, args):
+def report_telegram(m, period, args, funnel):
     if not m["trades"]:
-        return f"🧪 Backtest NVDA {period}\nNo hubo ninguna operación en el período."
+        text = f"🧪 Backtest NVDA {period} (datos {args.feed})\nNo hubo ninguna operación en el período."
+        blocker = top_blocker(funnel)
+        if blocker:
+            side, name, count = blocker
+            text += (
+                f"\n\nEl filtro que más bloquea es \"{name}\" ({side}): "
+                f"sin él habría habido {count} señales.\n"
+                "El detalle de todos los filtros está en GitHub Actions."
+            )
+        return text
     return (
         f"🧪 Backtest NVDA {period} (datos {args.feed})\n"
         f"{verdict(m)}\n\n"
@@ -335,7 +385,7 @@ def main():
         raise RuntimeError(f"Datos insuficientes: {len(frame)} velas.")
     session_closes = fetch_closes(start, end)
 
-    trades, skipped = simulate(frame, session_closes, args.equity, args.slippage)
+    trades, skipped, funnel = simulate(frame, session_closes, args.equity, args.slippage)
     m = metrics(trades, args.equity, frame)
     period = f"{frame.index[0]:%Y-%m-%d} a {frame.index[-1]:%Y-%m-%d}"
 
@@ -345,14 +395,14 @@ def main():
         writer.writeheader()
         writer.writerows(trades)
 
-    report = report_markdown(m, period, args, skipped)
+    report = report_markdown(m, period, args, skipped, funnel)
     print(report)
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as file:
             file.write(report + "\n")
     if args.telegram:
-        bot.telegram(report_telegram(m, period, args))
+        bot.telegram(report_telegram(m, period, args, funnel))
 
 
 if __name__ == "__main__":
