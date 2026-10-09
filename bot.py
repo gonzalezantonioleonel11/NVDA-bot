@@ -25,11 +25,13 @@ MAX_NOTIONAL_PCT = 20.0        # cap exposure to 20% of equity per position
 MAX_DRIFT_ATR = 0.5             # reject if price moved too far from signal close
 MAX_OPEN_POSITIONS = 1
 ENTRY_START = dtime(9, 45)
-ENTRY_END = dtime(15, 20)
-FORCE_FLAT_TIME = dtime(15, 50)
+# Relative to Alpaca's real close, so half-day sessions (13:00 close) are handled.
+ENTRY_STOP_BEFORE_CLOSE = pd.Timedelta(minutes=40)   # 15:20 on a normal day
+FORCE_FLAT_BEFORE_CLOSE = pd.Timedelta(minutes=10)   # 15:50 on a normal day
+ERROR_REPEAT_SECONDS = 3600    # don't resend the same error alert more than once an hour
 
-KEY = os.environ["ALPACA_KEY"]
-SECRET = os.environ["ALPACA_SECRET"]
+KEY = os.environ.get("ALPACA_KEY", "")
+SECRET = os.environ.get("ALPACA_SECRET", "")
 TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 MANUAL = os.environ.get("MANUAL", "false").lower() == "true"
@@ -270,6 +272,22 @@ def save_state(state):
         json.dump(state, file, indent=2)
 
 
+# Keys that must survive the daily reset (an open trade, the last error alert).
+PERSISTENT_KEYS = ("open_trade", "last_error", "last_error_at")
+
+
+def new_day_state(today, old_state):
+    state = {"date": today, "count": 0, "last_bar": ""}
+    for key in PERSISTENT_KEYS:
+        if key in old_state:
+            state[key] = old_state[key]
+    return state
+
+
+def money(value):
+    return f"{'+' if value >= 0 else '-'}${abs(value):,.2f}"
+
+
 def telegram_api(method, payload):
     if not TG_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN no está configurado; no se puede pedir aprobación.")
@@ -433,25 +451,160 @@ def has_position_or_open_order():
     return False, ""
 
 
-def close_position_end_of_day():
+def close_position_end_of_day(state):
     orders = api("GET", "/v2/orders", params={"status": "open", "symbols": SYMBOL, "limit": 100})
     for order in orders or []:
         api("DELETE", f"/v2/orders/{order['id']}")
     position = api("GET", f"/v2/positions/{SYMBOL}", allow_404=True)
     if position:
-        api("DELETE", f"/v2/positions/{SYMBOL}")
-        telegram("🧹 Cierre de fin de día solicitado para NVDA en PAPER. Verificá en Alpaca que la posición se haya cerrado.")
+        exit_order = api("DELETE", f"/v2/positions/{SYMBOL}")
+        # Remember the closing order so the next run can report the result.
+        if state.get("open_trade") and exit_order:
+            state["open_trade"]["exit_order_id"] = exit_order.get("id")
+        telegram("🧹 Cierre de fin de día solicitado para NVDA en PAPER. En unos minutos te llega el resultado.")
     else:
         print("Fin de día: no hay posición NVDA abierta.")
 
 
+def check_open_trade(state):
+    """Report the result of the bot's trade once its stop, take profit or EOD close fills."""
+    trade = state.get("open_trade")
+    if not trade:
+        return
+
+    order = api("GET", f"/v2/orders/{trade['order_id']}", params={"nested": "true"})
+    if float(order.get("filled_qty") or 0) == 0:
+        if order.get("status") in ("canceled", "expired", "rejected"):
+            telegram(f"ℹ️ La orden NVDA {trade['side']} no se ejecutó (estado: {order['status']}).")
+            state.pop("open_trade")
+        return
+
+    side = trade["side"]
+    qty = float(order["filled_qty"])
+    entry = float(order["filled_avg_price"])
+    exit_price, reason = None, None
+    for leg in order.get("legs") or []:
+        if leg.get("status") == "filled":
+            exit_price = float(leg["filled_avg_price"])
+            reason = "TAKE PROFIT" if leg.get("type") == "limit" else "STOP LOSS"
+            break
+    if exit_price is None and trade.get("exit_order_id"):
+        exit_order = api("GET", f"/v2/orders/{trade['exit_order_id']}")
+        if exit_order.get("status") == "filled":
+            exit_price = float(exit_order["filled_avg_price"])
+            reason = "CIERRE DE FIN DE DÍA"
+
+    if exit_price is None:
+        if api("GET", f"/v2/positions/{SYMBOL}", allow_404=True):
+            return  # still open
+        telegram(
+            f"ℹ️ La posición NVDA {side} se cerró fuera del bot.\n"
+            "Revisá el resultado en Alpaca."
+        )
+        state.setdefault("closed_today", []).append(
+            {"side": side, "qty": qty, "reason": "CERRADA FUERA DEL BOT", "pnl": None}
+        )
+        state.pop("open_trade")
+        return
+
+    pnl = (exit_price - entry) * qty * (1 if side == "LONG" else -1)
+    icon = {"TAKE PROFIT": "🎯", "STOP LOSS": "🛑"}.get(reason, "🧹")
+    telegram(
+        f"{icon} {reason}: NVDA {side} cerrada\n"
+        f"Cantidad: {qty:g}\n"
+        f"Entrada: {entry:.2f} → Salida: {exit_price:.2f}\n"
+        f"Resultado: {money(pnl)}"
+    )
+    state.setdefault("closed_today", []).append(
+        {"side": side, "qty": qty, "reason": reason, "pnl": round(pnl, 2)}
+    )
+    state.pop("open_trade")
+
+
+def send_open_message(close_ny):
+    account = api("GET", "/v2/account")
+    half_day = " (media jornada)" if close_ny.time() < dtime(16, 0) else ""
+    telegram(
+        "✅ Bot activo: mercado abierto\n"
+        f"Equity: ${float(account['equity']):,.2f}\n"
+        f"Cierre de hoy: {close_ny.strftime('%H:%M')} NY{half_day}\n"
+        "Si no hay señales, no vas a recibir más mensajes hasta el resumen del cierre."
+    )
+
+
+def send_daily_summary(state):
+    account = api("GET", "/v2/account")
+    equity = float(account["equity"])
+    last_equity = float(account.get("last_equity") or equity)
+    closed = state.get("closed_today", [])
+
+    lines = [
+        f"📊 Resumen del día {state['date']} (PAPER)",
+        f"Operaciones enviadas hoy: {state.get('count', 0)}",
+    ]
+    if closed:
+        lines.append("Operaciones cerradas:")
+        for trade in closed:
+            result = money(trade["pnl"]) if trade.get("pnl") is not None else "sin dato"
+            lines.append(f"• {trade['side']} x{trade['qty']:g}: {trade['reason']} {result}")
+    else:
+        lines.append("Operaciones cerradas: ninguna")
+    lines.append(f"Resultado del día (cuenta Alpaca): {money(equity - last_equity)}")
+    lines.append(f"Equity: ${equity:,.2f}")
+    position = api("GET", f"/v2/positions/{SYMBOL}", allow_404=True)
+    if position:
+        lines.append(f"⚠️ Quedó una posición NVDA abierta: {position.get('qty')} acciones. Revisala en Alpaca.")
+    telegram("\n".join(lines))
+
+
+def redact(text):
+    for secret in (TG_TOKEN, KEY, SECRET):
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
+def report_error(exc):
+    """Alert by Telegram when a run crashes, without repeating the same error every 5 minutes."""
+    error = redact(f"{type(exc).__name__}: {exc}")[:800]
+    state = load_state()
+    now = time.time()
+    if state.get("last_error") == error and now - state.get("last_error_at", 0) < ERROR_REPEAT_SECONDS:
+        print("Mismo error que la ejecución anterior; no se reenvía a Telegram.")
+        return
+    try:
+        telegram(f"⚠️ El bot falló\n{error}\n\nRevisá el log en GitHub Actions.")
+    except Exception as tg_exc:
+        print("No se pudo avisar el error por Telegram:", redact(str(tg_exc)))
+        return
+    state["last_error"] = error
+    state["last_error_at"] = now
+    save_state(state)
+
+
+def clear_error():
+    state = load_state()
+    if "last_error" not in state:
+        return
+    state.pop("last_error")
+    state.pop("last_error_at", None)
+    save_state(state)
+    try:
+        telegram("✅ El bot volvió a funcionar normalmente.")
+    except Exception as tg_exc:
+        print("No se pudo avisar la recuperación por Telegram:", redact(str(tg_exc)))
+
+
 def main():
+    if not KEY or not SECRET:
+        raise RuntimeError("Faltan ALPACA_KEY o ALPACA_SECRET en los secrets de GitHub.")
+
     now_utc = pd.Timestamp.now(tz="UTC")
     now_ny = now_utc.tz_convert(NY)
     state = load_state()
     today = now_ny.strftime("%Y-%m-%d")
     if state.get("date") != today:
-        state = {"date": today, "count": 0, "last_bar": ""}
+        state = new_day_state(today, state)
 
     # Manual workflow runs are diagnostics only; they never place orders.
     if MANUAL:
@@ -467,18 +620,32 @@ def main():
         save_state(state)
         return
 
+    check_open_trade(state)
+    save_state(state)
+
     clock = get_clock()
     if not clock.get("is_open", False):
+        if state.get("session_seen") and not state.get("summary_sent"):
+            send_daily_summary(state)
+            state["summary_sent"] = True
         print("Mercado cerrado según Alpaca; no se opera.")
         save_state(state)
         return
 
-    if now_ny.time() >= FORCE_FLAT_TIME:
-        close_position_end_of_day()
+    close_ny = pd.Timestamp(clock["next_close"]).tz_convert(NY)
+    entry_end = (close_ny - ENTRY_STOP_BEFORE_CLOSE).time()
+
+    if not state.get("session_seen"):
+        send_open_message(close_ny)
+        state["session_seen"] = True
+        save_state(state)
+
+    if now_ny >= close_ny - FORCE_FLAT_BEFORE_CLOSE:
+        close_position_end_of_day(state)
         save_state(state)
         return
 
-    if not (ENTRY_START <= now_ny.time() < ENTRY_END):
+    if not (ENTRY_START <= now_ny.time() < entry_end):
         print(f"Fuera del horario de nuevas entradas: {now_ny.strftime('%H:%M')} NY.")
         save_state(state)
         return
@@ -507,7 +674,7 @@ def main():
     enriched = add_indicators(completed)
     candidates = []
     for bar_time, row in enriched.iloc[-3:].iterrows():
-        if bar_time.time() < ENTRY_START or bar_time.time() >= ENTRY_END:
+        if bar_time.time() < ENTRY_START or bar_time.time() >= entry_end:
             continue
         bar_iso = bar_time.tz_convert("UTC").isoformat()
         if bar_iso <= state.get("last_bar", ""):
@@ -595,6 +762,7 @@ def main():
 
     order = send_order(side, qty, stop_price, tp_price)
     state["count"] = state.get("count", 0) + 1
+    state["open_trade"] = {"order_id": order["id"], "side": side}
     save_state(state)
     telegram(
         f"✅ Orden enviada a Alpaca PAPER\n"
@@ -602,5 +770,14 @@ def main():
     )
 
 
+def run():
+    try:
+        main()
+    except Exception as exc:
+        report_error(exc)
+        raise
+    clear_error()
+
+
 if __name__ == "__main__":
-    main()
+    run()
