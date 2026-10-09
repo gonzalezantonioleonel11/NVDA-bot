@@ -1,0 +1,83 @@
+name: orb-bot
+
+on:
+  schedule:
+    # Sesión (selección a las 9:35 y entradas hasta las 11:00 NY). Arranca antes y espera,
+    # para no depender de los atrasos de GitHub. Hay crons para horario de verano y de invierno;
+    # el que no corresponde sale solo.
+    - cron: "45 12 * * 1-5"
+    - cron: "5 13 * * 1-5"
+    - cron: "45 13 * * 1-5"
+    - cron: "5 14 * * 1-5"
+    # Cierre de todo a las 15:50 NY y resumen del día.
+    - cron: "25 19 * * 1-5"
+    - cron: "40 19 * * 1-5"
+    - cron: "25 20 * * 1-5"
+    - cron: "40 20 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "diagnostic: muestra la selección sin operar"
+        type: choice
+        options:
+          - diagnostic
+          - session
+          - close
+        default: diagnostic
+
+permissions:
+  contents: write
+
+concurrency:
+  group: orb-${{ (contains(github.event.schedule, ' 19 ') || contains(github.event.schedule, ' 20 ') || inputs.mode == 'close') && 'close' || 'session' }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install pandas requests
+
+      - name: Ejecutar bot ORB5 (PAPER)
+        env:
+          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            MODE="$INPUT_MODE"
+          else
+            case "$SCHEDULE" in
+              *" 19 "*|*" 20 "*) MODE=close ;;
+              *) MODE=session ;;
+            esac
+          fi
+          echo "Modo: $MODE"
+          python orb_bot.py "$MODE"
+
+      - name: Guardar registro de operaciones
+        if: always()
+        run: |
+          if [ -f orb_journal.csv ]; then
+            git add orb_journal.csv
+            if ! git diff --cached --quiet; then
+              git config user.name "nvda-bot"
+              git config user.email "bot@users.noreply.github.com"
+              git commit -m "Registro ORB5 del día"
+              git pull --rebase --autostash
+              git push
+            fi
+          fi
