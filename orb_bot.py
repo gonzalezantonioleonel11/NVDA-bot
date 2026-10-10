@@ -4,10 +4,11 @@ Bot de day trading por ruptura del rango de apertura (ORB) en Alpaca PAPER.
 Cada día, al terminar el rango de apertura (por defecto los primeros 15 minutos), elige las
 acciones "en juego": las de mayor volumen relativo en ese rango dentro del universo. Opera la
 primera ruptura confirmada (una vela de 1 minuto que cierra fuera del rango) con el stop-loss
-en el otro extremo del rango puesto en Alpaca, y cierra todo 10 minutos antes del cierre. Si ese
-cierre fallara, el stop (GTC) sigue protegiendo la posición y la sesión siguiente la cierra en
-la apertura. Es la variante más consistente en research/ con datos SIP e IEX (ver el workflow
-"research").
+en el otro extremo del rango puesto en Alpaca, y cierra todo 10 minutos antes del cierre: el
+resumen sale recién cuando Alpaca confirma que no quedó nada abierto, y si a los 2 minutos sigue
+algo abierto avisa y reintenta. Si el mercado cierra sin poder cerrarlo, el stop (GTC) sigue
+protegiendo la posición y la sesión siguiente la cierra en la apertura. Es la variante más
+consistente en research/ con datos SIP e IEX (ver el workflow "research").
 
 Modos (los elige el workflow orb.yml):
   python orb_bot.py session     ~9:00-12:00 NY: selección y entradas (en media jornada también cierra)
@@ -58,6 +59,8 @@ RISK_PCT = 1.0            # % del equity arriesgado por operación
 LEV_CAP = 4.0             # exposición total máxima (x equity), repartida entre TOP_N posiciones
 ENTRY_DEADLINE_MIN = 12 * 60   # no abre operaciones después de las 12:00 NY
 FLATTEN_BEFORE_CLOSE = pd.Timedelta(minutes=10)
+CLOSE_CHECK_SECONDS = 3   # al cierre, cada cuánto se le pregunta a Alpaca si quedó algo abierto
+CLOSE_RETRY = pd.Timedelta(minutes=2)   # si a los 2 minutos sigue algo abierto: aviso, sin resumen, y reintenta
 MIN_STOP_PCT = 0.0005     # no opera stops más chicos que 0,05% del precio
 POLL_SECONDS = 5
 LISTEN_MINUTES = 14       # cada corrida del workflow telegram.yml escucha este tiempo
@@ -327,7 +330,7 @@ def run_session():
     # Half days close at 13:00, before the afternoon job runs: flatten from here.
     if session_close.hour < 15:
         wait_until(session_close - FLATTEN_BEFORE_CLOSE)
-        flatten_and_report(session_open)
+        flatten_and_report(session_open, session_close)
 
 
 def our_orders(session_open):
@@ -385,11 +388,15 @@ def try_api(method, path, **kwargs):
         return None
 
 
+def open_orders(symbols):
+    return [o for o in bot.api("GET", "/v2/orders", params={"status": "open", "limit": 500}) or []
+            if o["symbol"] in symbols]
+
+
 def cancel_orders(symbols):
     """Cancels every open order on these symbols (the stop legs included)."""
-    for o in bot.api("GET", "/v2/orders", params={"status": "open", "limit": 500}) or []:
-        if o["symbol"] in symbols:
-            try_api("DELETE", f"/v2/orders/{o['id']}", allow_404=True)
+    for o in open_orders(symbols):
+        try_api("DELETE", f"/v2/orders/{o['id']}", allow_404=True)
 
 
 def wait_closed(symbols, tries):
@@ -400,6 +407,41 @@ def wait_closed(symbols, tries):
             break
         time.sleep(2)
     return left
+
+
+def close_all(symbols):
+    """Cancels the pending orders on these symbols (the stops) and sends the close of every position."""
+    try:
+        cancel_orders(symbols)
+        for _ in range(5):  # the cancels free the shares the closing orders need
+            time.sleep(2)
+            if not open_orders(symbols):
+                break
+        for sym in open_positions(symbols):
+            try_api("DELETE", f"/v2/positions/{sym}", allow_404=True)
+    except requests.RequestException as exc:  # whatever did not get done is retried in the next round
+        print("Falló una consulta a Alpaca al cerrar:", bot.redact(str(exc))[:200])
+
+
+def left_open(symbols):
+    """What Alpaca still has open on these symbols: {symbol: "posición" or "orden"}."""
+    left = {o["symbol"]: "orden" for o in open_orders(symbols)}
+    left.update(dict.fromkeys(open_positions(symbols), "posición"))
+    return left
+
+
+def wait_flat(symbols, until):
+    """Asks Alpaca every CLOSE_CHECK_SECONDS whether anything is still open on these symbols, until
+    nothing is or until `until`; returns what is still open."""
+    left = None
+    while True:
+        try:
+            left = left_open(symbols)
+        except requests.RequestException as exc:  # a failed check proves nothing: ask again
+            print("Falló una consulta a Alpaca:", bot.redact(str(exc))[:200])
+        if left == {} or pd.Timestamp.now(tz=NY) >= until:
+            return left if left is not None else left_open(symbols)
+        time.sleep(CLOSE_CHECK_SECONDS)
 
 
 def original_stop(orders, sym):
@@ -422,25 +464,38 @@ def protect(position, stop, today):
     return try_api("POST", "/v2/orders", payload=payload) is not None
 
 
-def flatten_and_report(session_open):
+def flatten_and_report(session_open, session_close):
+    """The close: cancel the pending orders and close every position, then ask Alpaca every 3 s
+    whether anything is still open; the summary waits until nothing is. If something is still
+    open after 2 minutes there is no summary yet: an alert, and everything is tried again, until
+    the market closes."""
     orders = our_orders(session_open)
     recent = {o["symbol"] for o in bot_orders(session_open - pd.Timedelta(days=10))}
     symbols = sorted({o["symbol"] for o in orders} | set(open_positions(recent)))
-    # Cancel the stops and close. A request that fails does not stop the rest, and whatever is
-    # still open after the wait gets a second try.
-    left = symbols
-    for _ in range(2):
-        cancel_orders(left)
-        time.sleep(2)
-        for sym in open_positions(left):
-            try_api("DELETE", f"/v2/positions/{sym}", allow_404=True)
-        # Wait until the closing orders have really filled before adding up the results.
-        left = wait_closed(symbols, 23)
-        if not left:
+    attempt = 1
+    while True:
+        close_all(symbols)
+        left = wait_flat(symbols, min(pd.Timestamp.now(tz=NY) + CLOSE_RETRY, session_close))
+        if not left or pd.Timestamp.now(tz=NY) >= session_close - pd.Timedelta(seconds=30):
             break
-    # Anything still open lost its stop when the orders were cancelled: protect it again.
+        attempt += 1
+        bot.telegram(f"⚠️ No se pudo cerrar {', '.join(sorted(left))}, revisalo en Alpaca. "
+                     f"Vuelvo a intentar (intento {attempt}).")
+    if left:
+        protect_left(left, orders, session_open)
+    report(session_open, symbols, orders)
+
+
+def protect_left(left, orders, session_open):
+    """The market closed with something still open. A position lost its stop when its orders
+    were cancelled: it gets the original stop back as a GTC order. An order that could not be
+    cancelled is reported, because without its position a stop would open a new trade."""
     today = session_open.strftime("%Y%m%d")
-    for sym in left:
+    for sym, kind in sorted(left.items()):
+        if kind == "orden":
+            bot.telegram(f"🚨 {NAME}: quedó una orden abierta en {sym} que no pude cancelar. Cancelala a mano "
+                         "en Alpaca: sin la posición, si se activa abriría una operación nueva.")
+            continue
         cancel_orders([sym])  # a close order still pending would hold the shares the stop needs
         time.sleep(1)
         position = open_positions([sym]).get(sym)
@@ -448,39 +503,46 @@ def flatten_and_report(session_open):
             continue  # it closed after all
         stop = original_stop(orders, sym)
         ok = stop is not None and protect(position, stop, today)
-        bot.telegram(f"🚨 {NAME}: no pude cerrar {sym}. " + (
+        bot.telegram(f"🚨 {NAME}: el mercado cerró y no pude cerrar {sym}. " + (
             f"Le puse un stop GTC en {stop:.2f} para que siga protegida esta noche; mañana a la apertura la cierro."
             if ok else "No pude ponerle un stop: revisala y cerrala a mano en Alpaca."))
-    report(session_open, symbols, orders)
 
 
 def open_positions(symbols):
     return {p["symbol"]: p for p in bot.api("GET", "/v2/positions") or [] if p["symbol"] in symbols}
 
 
-def realized(fills, orders, skip=()):
-    """Result per symbol of the bot's trades today, from the day's fills: only stocks the bot
-    entered today, and only fills from that entry on (a leftover closed at the open is not part
-    of it, and a closing fill alone is not a result)."""
+def fill_totals(fills, orders, skip=()):
+    """Cash flow and net shares per stock of the bot's trades today, from the day's fills: only
+    stocks the bot entered today, and only fills from that entry on (a leftover closed at the
+    open is not part of it). A closed trade nets to 0 shares and its cash flow is its result."""
     start = {}
     for o in orders:
         t = pd.Timestamp(o.get("submitted_at") or o["created_at"])
         start[o["symbol"]] = min(start.get(o["symbol"], t), t)
-    pnl = {}
+    totals = {}
     for f in fills:
         sym = f.get("symbol")
         if sym in start and sym not in skip and pd.Timestamp(f["transaction_time"]) >= start[sym]:
-            sign = -1 if f["side"] == "buy" else 1
-            pnl[sym] = pnl.get(sym, 0.0) + sign * float(f["qty"]) * float(f["price"])
-    return pnl
+            qty = float(f["qty"]) * (1 if f["side"] == "buy" else -1)
+            cash, shares = totals.get(sym, (0.0, 0.0))
+            totals[sym] = (cash - qty * float(f["price"]), shares + qty)
+    return totals
 
 
 def report(session_open, symbols, orders):
     """Result per symbol: realized from today's fills for closed ones; open ones are listed apart
     with their unrealized result, because a half-closed position's cash flow is not a result."""
     still_open = open_positions(symbols)
-    fills = bot.api("GET", "/v2/account/activities/FILL", params={"date": session_open.strftime("%Y-%m-%d")}) or []
-    pnl = realized(fills, orders, skip=still_open)
+    # A fill can reach the activities a moment after its order shows as filled: wait until every
+    # closed trade has as many shares bought as sold before adding up.
+    for _ in range(10):
+        fills = bot.api("GET", "/v2/account/activities/FILL", params={"date": session_open.strftime("%Y-%m-%d")}) or []
+        totals = fill_totals(fills, orders, skip=still_open)
+        if all(abs(shares) < 1e-6 for _, shares in totals.values()):
+            break
+        time.sleep(CLOSE_CHECK_SECONDS)
+    pnl = {sym: cash for sym, (cash, _) in totals.items()}
     account = bot.api("GET", "/v2/account")
     equity, last_equity = float(account["equity"]), float(account.get("last_equity") or account["equity"])
     lines = [f"📊 Resumen {NAME} {session_open:%Y-%m-%d} (PAPER)"]
@@ -533,7 +595,7 @@ def run_close():
         print("El resumen de hoy ya está en el registro; sale sin repetirlo.")
         return
     wait_until(flatten_at)
-    flatten_and_report(session_open)
+    flatten_and_report(session_open, session_close)
 
 
 def run_diagnostic():
@@ -577,7 +639,8 @@ def run_status():
         lines.append("Sin posiciones abiertas.")
     fills = bot.api("GET", "/v2/account/activities/FILL", params={"date": now.strftime("%Y-%m-%d")}) or []
     sess = today_session()
-    closed = realized(fills, our_orders(sess[0]) if sess else [], skip=open_symbols)
+    totals = fill_totals(fills, our_orders(sess[0]) if sess else [], skip=open_symbols)
+    closed = {sym: cash for sym, (cash, _) in totals.items()}
     if closed:
         lines.append("Cerradas hoy:")
         lines += [f"• {sym}: {bot.money(value)}" for sym, value in sorted(closed.items())]
