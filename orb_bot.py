@@ -12,7 +12,7 @@ consistente en research/ con datos SIP e IEX (ver el workflow "research").
 
 Modos (los elige el workflow orb.yml):
   python orb_bot.py session     ~9:00-12:00 NY: selección y entradas (en media jornada también cierra)
-  python orb_bot.py close       ~15:30-15:55 NY: cierra todo a las 15:50 y manda el resumen
+  python orb_bot.py close       ~12:00-16:00 NY: espera, cierra todo a las 15:50 y manda el resumen
   python orb_bot.py diagnostic  muestra la selección de la última sesión y la cuenta, sin operar
   python orb_bot.py status      posiciones abiertas, resultado del día y operaciones cerradas, sin operar
   python orb_bot.py listen      escucha comandos de Telegram ("estado", "ayuda") durante LISTEN_MINUTES
@@ -588,7 +588,9 @@ def run_close():
         return
     session_open, session_close = sess
     flatten_at = session_close - FLATTEN_BEFORE_CLOSE
-    if session_close.hour < 15 or not (flatten_at - pd.Timedelta(minutes=40) <= now <= session_close):
+    # The workflow starts the close hours ahead and it waits here, so that GitHub's delays on
+    # scheduled runs (half an hour is common) never make it miss 15:50.
+    if session_close.hour < 15 or not (flatten_at - pd.Timedelta(hours=4) <= now <= session_close):
         print(f"Fuera de la ventana de cierre ({now:%H:%M} NY); sale sin hacer nada.")
         return
     if journal_has(session_open.strftime("%Y-%m-%d")):

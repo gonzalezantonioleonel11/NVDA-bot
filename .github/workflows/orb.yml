@@ -9,11 +9,11 @@ on:
     - cron: "5 13 * * 1-5"
     - cron: "45 13 * * 1-5"
     - cron: "5 14 * * 1-5"
-    # Cierre de todo a las 15:50 NY y resumen del día.
-    - cron: "25 19 * * 1-5"
-    - cron: "40 19 * * 1-5"
-    - cron: "25 20 * * 1-5"
-    - cron: "40 20 * * 1-5"
+    # Cierre de todo a las 15:50 NY y resumen del día. Arranca horas antes y espera, porque GitHub
+    # atrasa los horarios (hasta media hora o más): 17:17 a 20:17 UTC son 13:17-16:17 NY en verano
+    # y 12:17-15:17 en invierno. El primero que corre cierra; los demás ven el resumen en el
+    # registro y salen. El minuto 17 es lo que identifica al cierre (ver concurrency y el paso del bot).
+    - cron: "17 17-20 * * 1-5"
   workflow_dispatch:
     inputs:
       mode:
@@ -30,7 +30,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: orb-${{ (contains(github.event.schedule, ' 19 ') || contains(github.event.schedule, ' 20 ') || inputs.mode == 'close') && 'close' || 'session' }}
+  group: orb-${{ (startsWith(github.event.schedule, '17 ') || inputs.mode == 'close') && 'close' || 'session' }}
   cancel-in-progress: false
 
 jobs:
@@ -70,7 +70,7 @@ jobs:
             MODE="$INPUT_MODE"
           else
             case "$SCHEDULE" in
-              *" 19 "*|*" 20 "*) MODE=close ;;
+              "17 "*) MODE=close ;;
               *) MODE=session ;;
             esac
           fi
