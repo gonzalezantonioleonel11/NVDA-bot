@@ -63,7 +63,8 @@ CLOSE_CHECK_SECONDS = 3   # al cierre, cada cuánto se le pregunta a Alpaca si q
 CLOSE_RETRY = pd.Timedelta(minutes=2)   # si a los 2 minutos sigue algo abierto: aviso, sin resumen, y reintenta
 MIN_STOP_PCT = 0.0005     # no opera stops más chicos que 0,05% del precio
 POLL_SECONDS = 5
-LISTEN_MINUTES = 14       # cada corrida del workflow telegram.yml escucha este tiempo
+LISTEN_MINUTES = 55       # cada corrida del workflow telegram.yml escucha este tiempo (GitHub arranca
+                          # una cada 20-35 min aunque el cron diga cada 5: más corto deja huecos)
 ORDER_PREFIX = "orb"
 JOURNAL = "orb_journal.csv"
 NAME = f"ORB{OR_MINUTES}"
