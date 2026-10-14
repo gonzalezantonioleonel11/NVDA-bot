@@ -1,8 +1,9 @@
 name: telegram-comandos
 
 # Escucha los comandos que mandás al bot de Telegram ("estado", "ayuda") y los responde.
-# Cada corrida escucha ~14 minutos y el cron arranca una nueva cada 5, así siempre hay una
-# esperando para seguir: de lunes a viernes, aprox. de 7 a 19 hs de Nueva York.
+# GitHub no respeta el "cada 5 minutos": arranca una corrida cada 20-35 minutos. Por eso cada
+# una escucha ~55 minutos (LISTEN_MINUTES); mientras tanto la siguiente queda en cola y arranca
+# apenas termina la anterior, sin huecos. De lunes a viernes, aprox. de 7 a 20 hs de Nueva York.
 on:
   schedule:
     - cron: "*/5 11-23 * * 1-5"
@@ -18,7 +19,7 @@ concurrency:
 jobs:
   listen:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 65
 
     steps:
       - uses: actions/checkout@v4
